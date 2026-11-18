@@ -14,7 +14,7 @@
 
 #include <windows.h>
 
-#define A11Y_VERSION      L"0.2.6.0"
+#define A11Y_VERSION      L"0.1.0.0"
 #define A11Y_PRODUCT      L"露西 -她所期望的一切- 无障碍补丁"
 #define A11Y_LOG_NAME     L"a11y.log"
 #define A11Y_INI_NAME     L"config.ini"
