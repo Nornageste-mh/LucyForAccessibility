@@ -24,6 +24,27 @@
 
 ## 0.2.5.0 — 发布前审计修复（2026-11-19）
 
+### 发布包实测（2026-11-19 05:47，真实游戏目录）
+
+- 发布包：`dist\LucyForAccessibility-0.2.5.0.zip`，190163 字节，12 文件 2 目录，
+  条目全部正斜杠；包内不再含 `project_status.md` / `AUDIT-*.md`，新增 `VERSION.txt`。
+- 安装（`tools\install.ps1 -GameDir <游戏目录> -SourceDir dist`）：原版哈希门禁通过，
+  备份改名为 `d3dx9_40_orig.dll`，写入补丁 sha256 `33624AA3C1CD0B446EC71C698100E756D782D4034B0F9BB51E8104F38A24F0D8`，
+  `a11y\install.json` 的 `version` 为 `0.2.5.0`（不再是 `unknown`）。
+- 启动：`a11y.log` 首行为 `=== Lucy accessibility patch 0.2.5.0 loaded`，
+  `RESOLVE ok=336 missing=0`、字体 vtable 钩子装上、语音后端自动选中 NVDA。
+- 卸载（`tools\uninstall.ps1`）：校验补丁哈希后还原，`d3dx9_40.dll` 回到原版
+  sha256 `16FD909AEB68D0D1ACA8529DC7F78880B97D6649D70CE8D03A2C858BC28E216B`，
+  `d3dx9_40_orig.dll` 删除，`a11y\` 日志保留。
+- 同期实机回归（同为 0.2.5.0 构建）：
+  - 纯键盘：标题按 `Enter` 启动游戏成功 → `Enter` 推进（3→4 句）→
+    `Backspace` 重读「第3条：机器人必须保护自己……」→ `Ctrl+Backspace` 同上 →
+    `Esc` 打开暂停菜单并播报「暂停菜单」（证据 `prod_logs\kb053516`）。
+  - 配音判据（默认配置，`voice_l1` 默认 1）：深档 47 句 → 45 句朗读、
+    2 句静默（「停不下来。」「「登录姓名。」」），即带配音台词不自动朗读生效
+    （证据 `prod_logs\voice053710`）。
+
+
 **范围**
 
 按 `docs/AUDIT-0.2.4.0.md` 的发布前审计结论，修复 6 个阻断项（B1–B6）与建议项
