@@ -410,7 +410,7 @@ static void Activate(void)
         Logf(L"menu: %s slot page=%d row=%d col=%d file=Save%02d.nkslot",
              g_screen == SCR_SAVE ? L"save" : L"load", g_savePage, row + 1, col + 1,
              slotNo);
-        g_slotWaitUntil = GetTickCount() + 3500;
+        g_slotWaitUntil = GetTickCount() + 6000;  // synthetic click holds 2000 ms, dialog needs ~2.5 s
         g_slotWasSave = (g_screen == SCR_SAVE);
         ClickAt(pt, 0);
         return;
@@ -694,6 +694,23 @@ void MenuTick(DWORD now)
     if (g_screen == SCR_TITLE && TextStoryRecent(800)) {
         MenuSetScreen(SCR_NOVEL);
     }
+    // Desync guard: if we think we are in the story but the game never actually
+    // started (a swallowed synthetic click, a failed title hand-off), fall back
+    // to the title state so Enter tries again instead of the player being stuck
+    // on a screen the game does not know about.
+    static DWORD s_novelUntil;
+    static int s_novelHadStory;
+    if (g_screen == SCR_NOVEL) {
+        if (!s_novelUntil && !s_novelHadStory) { s_novelUntil = now + 20000; }
+        if (TextStoryRecent(1200)) { s_novelHadStory = 1; s_novelUntil = 0; }
+        else if (s_novelUntil && (long)(now - s_novelUntil) >= 0) {
+            s_novelUntil = 0;
+            s_novelHadStory = 0;
+            Logf(L"menu: no story text for 20 s, reverting to title state");
+            SpeakMenu(L"没有进入剧情，请再按一次回车");
+            MenuSetScreen(SCR_TITLE);
+        }
+    } else { s_novelUntil = 0; s_novelHadStory = 0; }
     static DWORD s_choiceCheck;
     if ((long)(now - s_choiceCheck) >= 0) {
         s_choiceCheck = now + 250;
@@ -751,7 +768,10 @@ void MenuTick(DWORD now)
             Logf(L"menu: slot click produced no dialog (save=%d)", g_slotWasSave);
         }
     }
-    if (g_pendingScreen >= 0 && (long)(now - g_pendingScreenTick) >= 0) {
+    // Wait for the synthetic click to finish before switching screens: one
+    // activation takes ~2.2 s (æä½ 2000 ms), and switching earlier made the next
+    // key act on a screen the game had not opened yet (save/load misfires).
+    if (g_pendingScreen >= 0 && !InputClickBusy() && (long)(now - g_pendingScreenTick) >= 0) {
         MenuSetScreen(g_pendingScreen);
         g_pendingScreen = -1;
     }
