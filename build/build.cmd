@@ -20,6 +20,7 @@ rem ===========================================================================
 setlocal
 set ROOT=%~dp0..
 set OUTDIR=%ROOT%\build\out
+if "%OUTDIR%"=="" set OUTDIR=%ROOT%build\out
 
 if "%VCVARS%"=="" (
   echo [x] VCVARS is not set - point it at vcvars32.bat
@@ -31,6 +32,11 @@ if not exist "%VCVARS%" (
 )
 if not exist "%ROOT%\src\a11y.cpp" (
   echo [x] src\a11y.cpp not found - the source is maintained in src\
+  exit /b 1
+)
+if not exist "%ROOT%\src\forward.cpp" (
+  echo [x] src\forward.cpp missing - run: python tools\gen_forward.py --dll "^
+       "<game>\d3dx9_40_orig.dll" --out src
   exit /b 1
 )
 
@@ -66,22 +72,69 @@ set LOG=%ROOT%\build_log.txt
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 del "%LOG%" 2>nul
 del "%OUTDIR%\d3dx9_40.dll" 2>nul
+del "%OUTDIR%\*.obj" 2>nul
 
-cl /c %CL% %INC% /Fo"%OUTDIR%\a11y.obj" "%ROOT%\src\a11y.cpp" >>"%LOG%" 2>&1
+set SRC=%ROOT%\src
+
+rem Note: no "for" loop here. Inside a parenthesised block cmd.exe expands
+rem %OBJS% when the block is parsed, so an appended object list silently loses
+rem every entry but the last one and the link fails with missing symbols.
+echo [i] compiling a11y.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\a11y.obj" "%SRC%\a11y.cpp" >>"%LOG%" 2>&1
 if errorlevel 1 (
-  echo [x] compile failed - see %LOG%
+  echo [x] compile failed: a11y.cpp - see %LOG%
   exit /b 1
 )
 
-rem Optional .def: a proxy DLL usually forwards the original exports. If the
-rem source tree provides src\a11y.def it is passed to the linker automatically.
-set LINK_DEF=
-if exist "%ROOT%\src\a11y.def" set LINK_DEF=/DEF:"%ROOT%\src\a11y.def"
+echo [i] compiling fonthook.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\fonthook.obj" "%SRC%\fonthook.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: fonthook.cpp - see %LOG%
+  exit /b 1
+)
+
+echo [i] compiling menus.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\menus.obj" "%SRC%\menus.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: menus.cpp - see %LOG%
+  exit /b 1
+)
+
+echo [i] compiling proxy.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\proxy.obj" "%SRC%\proxy.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: proxy.cpp - see %LOG%
+  exit /b 1
+)
+
+echo [i] compiling forward.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\forward.obj" "%SRC%\forward.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: forward.cpp - see %LOG%
+  exit /b 1
+)
+
+echo [i] compiling speech\speech.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\speech.obj" "%SRC%\speech\speech.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: speech\speech.cpp - see %LOG%
+  exit /b 1
+)
+
+echo [i] compiling audio\audio_hook.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\audio_hook.obj" "%SRC%\audio\audio_hook.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: audio\audio_hook.cpp - see %LOG%
+  exit /b 1
+)
 
 set LINK_DEBUG=
 if "%DEV_BUILD%"=="1" set LINK_DEBUG=/DEBUG
 
-link /nologo /DLL /MACHINE:X86 %LINK_DEBUG% /OUT:"%OUTDIR%\d3dx9_40.dll" %LINK_DEF% "%OUTDIR%\a11y.obj" user32.lib gdi32.lib ole32.lib oleaut32.lib winmm.lib >>"%LOG%" 2>&1
+link /nologo /DLL /MACHINE:X86 %LINK_DEBUG% /OUT:"%OUTDIR%\d3dx9_40.dll" ^
+  "%OUTDIR%\a11y.obj" "%OUTDIR%\fonthook.obj" "%OUTDIR%\menus.obj" "%OUTDIR%\proxy.obj" ^
+  "%OUTDIR%\forward.obj" "%OUTDIR%\speech.obj" "%OUTDIR%\audio_hook.obj" ^
+  user32.lib gdi32.lib ole32.lib oleaut32.lib winmm.lib >>"%LOG%" 2>&1
 if errorlevel 1 (
   echo [x] link failed - see %LOG%
   exit /b 1
