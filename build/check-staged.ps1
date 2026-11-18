@@ -10,7 +10,7 @@
     1. 禁止提交构建产物 / 游戏资源 / 压缩包 / 日志（含扩展名与路径片段）；
     2. 单文件 > 20MB 直接拒绝；
     3. .ps1 含中文必须是 UTF-8 带 BOM（G5）；.cmd 必须纯 ASCII；
-    4. 版本号三处一致（src\version.h / README / CHANGELOG 顶部）；
+    4. 版本号三处一致（src\a11y.h / README / CHANGELOG 顶部）；
     5. P0 文档存在，且没把「导航模式」写进用户可见说明（第 0 条纪律）。
 #>
 [CmdletBinding()]
@@ -138,30 +138,30 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # 版本号一致性（三处：version.h / README 当前版本 / CHANGELOG 顶部）
+    # 版本号一致性（三处：a11y.h / README 当前版本 / CHANGELOG 顶部）
     # -----------------------------------------------------------------------
     $version = $null
-    $vh = Join-Path $Root 'src\version.h'
+    $vh = Join-Path $Root 'src\a11y.h'
     if (Test-Path -LiteralPath $vh) {
         $vhText = Get-Content -LiteralPath $vh -Raw -Encoding UTF8
-        $mv = [regex]::Match($vhText, '(?m)^\s*#\s*define\s+A11Y_VERSION\s+"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"?')
+        $mv = [regex]::Match($vhText, '(?m)^\s*#\s*define\s+A11Y_VERSION\s+L?"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"?')
         if ($mv.Success) { $version = $mv.Groups[1].Value }
-        else { $problems.Add("src\version.h 存在但读不到四段纯数字 A11Y_VERSION（G7）") }
+        else { $problems.Add("src\a11y.h 存在但读不到四段纯数字 A11Y_VERSION（G7）") }
     } else {
-        $warnings.Add("src\version.h 尚未提交（骨架阶段允许；发布前必须存在）")
+        $warnings.Add("src\a11y.h 尚未提交（骨架阶段允许；发布前必须存在）")
     }
     $readme = Join-Path $Root 'README.md'
     if ((Test-Path -LiteralPath $readme) -and $version) {
         $rm = [regex]::Match((Get-Content -LiteralPath $readme -Raw -Encoding UTF8), '当前版本[：:]\s*\*{0,2}([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)')
         if ($rm.Success -and $rm.Groups[1].Value -ne $version) {
-            $problems.Add("版本号不一致：version.h=$version，README=$($rm.Groups[1].Value)")
+            $problems.Add("版本号不一致：a11y.h=$version，README=$($rm.Groups[1].Value)")
         }
     }
     $changelog = Join-Path $Root 'CHANGELOG.md'
     if ((Test-Path -LiteralPath $changelog) -and $version) {
         $cm = [regex]::Match((Get-Content -LiteralPath $changelog -Raw -Encoding UTF8), '(?m)^##\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\b')
         if ($cm.Success -and $cm.Groups[1].Value -ne $version) {
-            $problems.Add("版本号不一致：version.h=$version，CHANGELOG=$($cm.Groups[1].Value)")
+            $problems.Add("版本号不一致：a11y.h=$version，CHANGELOG=$($cm.Groups[1].Value)")
         }
     }
 

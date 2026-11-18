@@ -38,6 +38,14 @@
  *      voice_min_dur_ms   = 250    已知总时长短于此的，不当台词
  *      voice_min_conf     = 2      只采信 conf>=2 的事件
  *      voice_log          = 1      写日志
+ *      voice_require_name = 0      1=要求资源名必须以 Voices\ 开头才算语音（更严；
+ *                                  默认 0，因为 L0 按实例类判定已足够，且个别语音
+ *                                  资源名可能不在 Voices\ 下）。资源名解出 BGMs\/FXs\
+ *                                  时无论该键如何都直接丢弃（误判≈0 优先）。
+ *      voice_l0/voice_l1/voice_l3 = 1  三层钩子开关（默认全开）
+ *
+ *  资源名解码：nekoHWMusic 实例 +0x2C 是 std::wstring（32 位：16B 内联缓冲 + size + cap），
+ *  解码器两种布局都试、只接受全 ASCII；解不出就记 <raw:...> 且不参与判定。
  *
  *  config.ini 位置：<游戏exe目录>\a11y\config.ini（不存在则试 <代理DLL目录>\a11y\config.ini）
  *      格式（键可写在任意 section 下，按行扫描，`#`/`;` 开头为注释）：
@@ -124,6 +132,17 @@ unsigned Audio__TestNow(void);
 void Audio__TestVoicePlay(int conf, int durMs, const char* name); /* 模拟 VOICE_PLAY */
 void Audio__TestVoiceStop(void);                              /* 模拟 VOICE_STOP */
 int  Audio__TestEventCount(void);                             /* 事件环形缓冲里的条数 */
+
+/* 资源名解码：p 指向一个"nekoHWMusic 布局"的内存（+0x2C 放 std::wstring）。
+ * 成功返回名字长度，失败 0 且 out 为空串。用于验证 wstring 内联/堆两种布局。 */
+int  Audio__TestDecodeName(const void* p, char* out, int cap);
+
+/* 资源名前缀分类：返回 0=unknown 1=voice 2=bgm 3=sfx（与日志 cat= 一致）。 */
+int  Audio__TestCatFromName(const char* src);
+
+/* 直接喂一条 L0 事件（跳过内联汇编 thunk）：用于验证"名字非语音则忽略"的分支。
+ * 返回 1=已记录 0=被忽略。self 必须是 nekoHWMusic 布局的对象（+0x74 放裸指针）。 */
+int  Audio__TestL0Play(const void* self);
 #endif
 
 #ifdef __cplusplus

@@ -39,9 +39,12 @@ void LogInit(const wchar_t* baseDir)
     wsprintfW(g_logPath, L"%s\\%s", g_dataDir, A11Y_LOG_NAME);
     g_log = _wfopen(g_logPath, L"ab");
     if (g_log) {
-        // mark each run
-        const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
-        if (ftell(g_log) == 0) { fwrite(bom, 1, 3, g_log); }
+        // Write UTF-8 ourselves: the speech layer appends to the same file and
+        // both writers must produce identical encoding.
+        if (ftell(g_log) == 0) {
+            const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+            fwrite(bom, 1, 3, g_log);
+        }
         g_logReady = 1;
     }
 }
@@ -59,9 +62,15 @@ void Logf(const wchar_t* fmt, ...)
 
     SYSTEMTIME st;
     GetLocalTime(&st);
+    char utf8[4096];
+    int n = WideCharToMultiByte(CP_UTF8, 0, msg, -1, utf8, (int)sizeof(utf8), 0, 0);
+    if (n <= 0) { return; }
+    char line[4300];
+    int m = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%02u:%02u:%02u.%03u] %s\n",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, utf8);
+    if (m <= 0) { return; }
     EnterCriticalSection(&g_logCs);
-    fwprintf(g_log, L"[%02u:%02u:%02u.%03u] %s\n", st.wHour, st.wMinute, st.wSecond,
-             st.wMilliseconds, msg);
+    fwrite(line, 1, (size_t)m, g_log);
     fflush(g_log);
     LeaveCriticalSection(&g_logCs);
 }
@@ -87,6 +96,7 @@ void ConfigLoad(void)
     g_cfg.voiceWindowMs = 1200;
     g_cfg.speakVoicedLines = 0;
     g_cfg.minStableMs = 260;
+    g_cfg.logDraws = 0;
     g_cfg.keyRepeat = VK_BACK;
     g_cfg.keyPrev = VK_BACK;      // with Ctrl
     g_cfg.keyBackendMod = VK_MENU; // Alt
@@ -115,6 +125,7 @@ void ConfigLoad(void)
         else if (!_wcsicmp(key, L"voice_window_ms")) { g_cfg.voiceWindowMs = _wtoi(val); }
         else if (!_wcsicmp(key, L"speak_voiced_lines")) { g_cfg.speakVoicedLines = _wtoi(val); }
         else if (!_wcsicmp(key, L"min_stable_ms")) { g_cfg.minStableMs = _wtoi(val); }
+        else if (!_wcsicmp(key, L"log_draws")) { g_cfg.logDraws = _wtoi(val); }
     }
     fclose(f);
     if (g_cfg.rate < 0) { g_cfg.rate = 0; }
@@ -141,9 +152,11 @@ void ConfigSave(void)
                "volume=%d\r\n"
                "voice_window_ms=%d\r\n"
                "speak_voiced_lines=%d\r\n"
-               "min_stable_ms=%d\r\n",
+               "min_stable_ms=%d\r\n"
+               "; log_draws=1 logs every painted string (diagnostics only)\r\n"
+               "log_draws=%d\r\n",
             backend, g_cfg.rate, g_cfg.volume, g_cfg.voiceWindowMs,
-            g_cfg.speakVoicedLines, g_cfg.minStableMs);
+            g_cfg.speakVoicedLines, g_cfg.minStableMs, g_cfg.logDraws);
     fclose(f);
 }
 
@@ -157,6 +170,16 @@ static int g_repCount;
 static int g_repPos;
 static CRITICAL_SECTION g_repCs;
 static int g_repReady;
+
+const wchar_t* RepeatLast(void)
+{
+    if (g_repCount == 0) { return L""; }
+    int idx = (g_repPos - 1 + REPEAT_MAX) % REPEAT_MAX;
+    return g_rep[idx];
+}
+
+// Ctrl+Backspace walks back through the re-read buffer, one line per press.
+static int g_repBack;
 
 void RepeatPush(const wchar_t* text)
 {
@@ -172,24 +195,22 @@ void RepeatPush(const wchar_t* text)
     wcsncpy_s(dst, REPEAT_LEN, text, _TRUNCATE);
     g_repPos = (g_repPos + 1) % REPEAT_MAX;
     if (g_repCount < REPEAT_MAX) { g_repCount++; }
+    g_repBack = 0;
     LeaveCriticalSection(&g_repCs);
-}
-
-const wchar_t* RepeatLast(void)
-{
-    if (g_repCount == 0) { return L""; }
-    int idx = (g_repPos - 1 + REPEAT_MAX) % REPEAT_MAX;
-    return g_rep[idx];
 }
 
 void RepeatPrev(void)
 {
-    if (g_repCount < 2) { return; }
-    // walk one entry back for the re-read key with Ctrl held
-    static int s_back = 1;
-    int idx = (g_repPos - 1 - s_back + REPEAT_MAX * 2) % REPEAT_MAX;
-    s_back++;
-    if (s_back >= g_repCount) { s_back = 1; }
+    if (g_repCount == 0) {
+        Speech_SpeakImmediate(L"没有可重读的剧情文本");
+        return;
+    }
+    if (g_repBack + 1 >= g_repCount) {
+        g_repBack = 0;   // wrap to the newest line
+    } else {
+        g_repBack++;
+    }
+    int idx = (g_repPos - 1 - g_repBack + REPEAT_MAX * 2) % REPEAT_MAX;
     Say(g_rep[idx]);
 }
 
@@ -198,6 +219,7 @@ void RepeatPrev(void)
 void Say(const wchar_t* text)
 {
     if (!text || !*text) { return; }
+    Logf(L"say: \"%s\"", text);
     Speech_Speak(text);
 }
 
@@ -205,10 +227,13 @@ void SayReplay(void)
 {
     const wchar_t* t = RepeatLast();
     if (!t || !*t) {
-        Speech_Speak(L"没有可重读的剧情文本");
+        Logf(L"re-read: buffer empty");
+        Speech_SpeakImmediate(L"没有可重读的剧情文本");
         return;
     }
-    Speech_Speak(t);
+    Logf(L"re-read: \"%s\"", t);
+    // Re-reading is a user action: it interrupts whatever is being said now.
+    Speech_SpeakImmediate(t);
 }
 
 // -------------------------------------------------------------- window/keys -
@@ -263,7 +288,7 @@ static int HandleHotkey(int vk, int isDown)
     }
     if (vk == g_cfg.keyRepeat) {
         if (ctrl) { RepeatPrev(); } else { SayReplay(); }
-        Logf(L"hotkey: re-read (ctrl=%d)", ctrl);
+        Logf(L"hotkey: re-read (ctrl=%d) vk=%d", ctrl, vk);
         return 1;
     }
     return 0;
@@ -275,6 +300,13 @@ static LRESULT CALLBACK LowLevelKb(int code, WPARAM w, LPARAM l)
         KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)l;
         int isDown = (w == WM_KEYDOWN || w == WM_SYSKEYDOWN);
         if (GameIsForeground()) {
+            if (g_cfg.logDraws && isDown) {   // diagnostics: what reaches the hook
+                static int s_keySeen;
+                if (s_keySeen < 300) {
+                    s_keySeen++;
+                    Logf(L"key: vk=%d down", (int)k->vkCode);
+                }
+            }
             if (HandleHotkey((int)k->vkCode, isDown)) { return 1; }
             MenuOnKey((int)k->vkCode, isDown);
             // MenuOnKey has no way to report back here yet; the arrow/enter keys
@@ -306,23 +338,28 @@ static DWORD WINAPI TickThread(void*)
 {
     // Everything heavy is initialised here, never in DllMain.
     ProxyInitLate();
+
+    // The launcher (Lucy.exe start-up stub) loads Engine.dll too, so the proxy is
+    // also present in a process that never shows a game window.  Wait for the real
+    // window before touching speech: starting the screen reader connection in the
+    // launcher only produces noise (and a second log) before it exits.
+    HWND w = 0;
+    for (int i = 0; i < 150 && !w; i++) {
+        w = FindGameWindow();
+        if (!w) { Sleep(100); }
+    }
+    if (!w) {
+        Logf(L"a11y: no NekoEngine window after 15 s, this process is not the game; idle");
+        return 0;
+    }
+    Logf(L"game window found: %p", (void*)w);
     TextInit();
     Speech_Init();
     Audio_InitAsync();
     Logf(L"a11y: subsystems up, backend=%s", Speech_BackendName());
+    MenuSetGameWnd(w);
+    MenuInit(w);
 
-    HWND w = 0;
-    for (int i = 0; i < 100 && !w; i++) {
-        Sleep(100);
-        w = FindGameWindow();
-    }
-    if (w) {
-        Logf(L"game window found: %p", (void*)w);
-        MenuSetGameWnd(w);
-        MenuInit(w);
-    } else {
-        Logf(L"game window NOT found");
-    }
     for (;;) {
         Sleep(30);
         DWORD now = GetTickCount();

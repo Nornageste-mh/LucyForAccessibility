@@ -7,7 +7,7 @@
     pwsh -File build\release.ps1
 
   可选：
-    -VersionFile <path>   默认 src\version.h
+    -VersionFile <path>   默认 src\a11y.h
     -SkipBuild            复用 build\out\d3dx9_40.dll（仍会跑守卫）
     -SkipPackage          只构建与守卫，不组装 dist 与 zip
 
@@ -36,19 +36,19 @@ function Write-Err([string]$m)  { Write-Host "  [x] $m" -ForegroundColor Red }
 function Die([string]$m) { Write-Err $m; Write-Host ""; Write-Host "发布中止（未生成发布包）。" -ForegroundColor Red; exit 1 }
 
 # ---------------------------------------------------------------------------
-# 步骤 1：从 src\version.h 读取 A11Y_VERSION（四段纯数字）
+# 步骤 1：从 src\a11y.h 读取 A11Y_VERSION（四段纯数字）
 # ---------------------------------------------------------------------------
 Write-Step "读取版本号"
-if ([string]::IsNullOrEmpty($VersionFile)) { $VersionFile = Join-Path $Root "src\version.h" }
+if ([string]::IsNullOrEmpty($VersionFile)) { $VersionFile = Join-Path $Root "src\a11y.h" }
 if (-not (Test-Path -LiteralPath $VersionFile)) {
-    Die "找不到版本号约定文件：$VersionFile（应由 src/version.h 提供 A11Y_VERSION，例如 #define A11Y_VERSION `"0.2.0.0`"）"
+    Die "找不到版本号约定文件：$VersionFile（应由 src/a11y.h 提供 A11Y_VERSION，例如 #define A11Y_VERSION L`"0.2.0.0`"）"
 }
 $vhText = Get-Content -LiteralPath $VersionFile -Raw -Encoding UTF8
-$lineMatch = [regex]::Match($vhText, '(?m)^\s*#\s*define\s+A11Y_VERSION\s+(.+?)\s*$')
+$lineMatch = [regex]::Match($vhText, '(?m)^\s*#\s*define\s+A11Y_VERSION\s+L?"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"?')
 if (-not $lineMatch.Success) {
     Die "版本号文件里没有 #define A11Y_VERSION：$VersionFile"
 }
-$rawVersion = $lineMatch.Groups[1].Value.Trim().Trim('"')
+$rawVersion = $lineMatch.Groups[1].Value.Trim()
 if ($rawVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') {
     Die "版本号形状不合法：'$rawVersion'。必须是四段纯数字（如 0.2.0.0），不能有字母或 v 前缀（Framework G7）。"
 }
@@ -65,7 +65,7 @@ if (Test-Path -LiteralPath $readmePath) {
     $readme = Get-Content -LiteralPath $readmePath -Raw -Encoding UTF8
     $mReadme = [regex]::Match($readme, '当前版本[：:]\s*\*{0,2}([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)')
     if ($mReadme.Success -and $mReadme.Groups[1].Value -ne $Version) {
-        Die "版本号不一致：version.h=$Version，README=$($mReadme.Groups[1].Value)。先同步再发布。"
+        Die "版本号不一致：a11y.h=$Version，README=$($mReadme.Groups[1].Value)。先同步再发布。"
     }
 }
 $changelogPath = Join-Path $Root "CHANGELOG.md"
@@ -73,7 +73,7 @@ if (Test-Path -LiteralPath $changelogPath) {
     $changelog = Get-Content -LiteralPath $changelogPath -Raw -Encoding UTF8
     $mChange = [regex]::Match($changelog, '(?m)^##\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\b')
     if ($mChange.Success -and $mChange.Groups[1].Value -ne $Version) {
-        Die "版本号不一致：version.h=$Version，CHANGELOG=$($mChange.Groups[1].Value)。先同步再发布。"
+        Die "版本号不一致：a11y.h=$Version，CHANGELOG=$($mChange.Groups[1].Value)。先同步再发布。"
     }
 }
 

@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 //  audio_hook.cpp -- Lucy (nkNovel 1.50) 配音判据模块 · GalA11y Forge
 //
 //  构建（32 位 /MT，编进 d3dx9_40 代理 DLL）：
@@ -48,7 +48,7 @@
 #define DEF_PREROLL_MS       150   // 行开始前多久内的语音也算本行
 #define DEF_MIN_PLAYED_MS    100   // 短于此就被 stop => 假启动，作废
 #define DEF_MIN_DUR_MS       250   // 已知总时长短于此 => 不当台词
-#define DEF_MIN_CONF           2   // 只采信 conf>=2
+#define DEF_MIN_CONF           1   // 采信 conf>=1（含 MUSIC_PLAY 时间窗启发式，见 OnMusicPlay）
 #define DEF_LOG                1
 
 #define AUDIO_MAX_EVT         64
@@ -77,6 +77,27 @@ enum { SS_REF=0, SS_UNREF=1, SS_GETFORMAT=2, SS_READ=3, SS_RESET=4, SS_ISSEEKABL
 #define ENGINE_LOADER_RVA        0x0DB5F0u
 #define VS_PLAY 7
 #define VS_STOP 8
+
+// nekoHWMusic：三种脚本级音频对象（Voice/BGMusic/Sound）共用的播放包装类。
+// 实例字段（[实测] ctor Engine+0xDB460，vtable 写入 0x101FA004，对象 0x84 字节）：
+//   +0x2C  std::wstring 资源名（ctor 里 call [0x101E71F8] = wstring::operator=(wchar_t*)）
+//   +0x3C  _Mysize（wchar 个数）  +0x40 _Myres（容量）
+//   +0x70  audiere::OutputStream*  +0x74 float 音量  +0x78 循环次数
+//   +0x7C  byte 待播标志            +0x80 StopCallback*
+// Voice/BGM/Sound 实例都在 +0x70 放一个 8 字节智能指针，裸指针在 +0x74，指向 nekoHWMusic。
+#define ENGINE_HWMUSIC_VTABLE_RVA 0x1FA004u
+#define ENGINE_HWMUSIC_CTOR_RVA   0x0DB460u
+
+// defined later, used earlier (config read / L1 open path)
+static int  g_vtSpy = 0;
+static void InstallStreamVtSpy(void* os);
+#define HWM_NAME_OFF   0x2Cu
+#define HWM_SIZE_OFF   0x3Cu
+#define HWM_RES_OFF    0x40u
+#define HWM_OS_OFF     0x70u
+#define HWM_SIZE       0x84u
+// 智能指针（Voice/BGMusic/Sound 实例内嵌，vtable=0x101EEF18）：裸指针在 +4
+#define SP_RAW_OFF     0x74u
 
 enum Cat { CAT_UNKNOWN=0, CAT_VOICE=1, CAT_BGM=2, CAT_SFX=3 };
 static const char* kCatName[] = { "unknown", "voice", "bgm", "sfx" };
@@ -158,8 +179,10 @@ static int g_minPlayedMs  = DEF_MIN_PLAYED_MS;
 static int g_minDurMs     = DEF_MIN_DUR_MS;
 static int g_minConf      = DEF_MIN_CONF;
 static int g_enableL0     = 1;     // voice_l0=0 可关（分阶段验证用）
-static int g_enableL1     = 1;     // voice_l1=0 可关
+static int g_enableL1     = 0;     // voice_l1=0 可关
 static int g_enableL3     = 1;     // voice_l3=0 可关（改 .text 的内联 hook）
+static int g_requireName  = 0;     // voice_require_name=1：L0 还要求资源名以 Voices\ 开头
+static int g_l1Vtable     = 0;     // voice_l1_vtable=1：L1 修补实例 vtable（实测在游戏内会 c0000005 崩溃，默认关）
 static char g_iniPath[MAX_PATH] = {0};
 
 static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -211,12 +234,15 @@ static void LoadConfig(HMODULE self)
     g_minConf     = Clamp(IniInt("voice_min_conf",      DEF_MIN_CONF),        1, 3);
     g_logEnabled  = IniInt("voice_log", DEF_LOG) ? 1 : 0;
     g_enableL0    = IniInt("voice_l0", 1) ? 1 : 0;
-    g_enableL1    = IniInt("voice_l1", 1) ? 1 : 0;
+    g_enableL1    = IniInt("voice_l1", 0) ? 1 : 0;
     g_enableL3    = IniInt("voice_l3", 1) ? 1 : 0;
+    g_requireName = IniInt("voice_require_name", 0) ? 1 : 0;
+g_l1Vtable    = IniInt("voice_l1_vtable", 0) ? 1 : 0;
+g_vtSpy       = IniInt("voice_vtspy", 0) ? 1 : 0;
     if (g_iniPath[0])
-        Log("[audio] NOTE  config: %s window=%d preroll=%d min_played=%d min_dur=%d min_conf=%d log=%d l0/l1/l3=%d%d%d",
+        Log("[audio] NOTE  config: %s window=%d preroll=%d min_played=%d min_dur=%d min_conf=%d log=%d l0/l1/l3=%d%d%d require_name=%d",
             g_iniPath, g_windowMs, g_preRollMs, g_minPlayedMs, g_minDurMs, g_minConf, g_logEnabled,
-            g_enableL0, g_enableL1, g_enableL3);
+            g_enableL0, g_enableL1, g_enableL3, g_requireName);
 }
 
 // =========================================================== 判据核心 =======
@@ -559,52 +585,106 @@ static void ShortName(const char* mangled, char* out, int cap)
     memcpy(out, p, n); out[n] = 0;
 }
 
-// 读 this+0x2C 的 std::string/std::wstring 资源名；失败输出 <raw:...>
-static void ReadNameField(void* self, char* out, int cap)
+// --------------------------------------------------------- 资源名解码 ------
+// nekoHWMusic+0x2C 是 std::wstring（[实测] ctor Engine+0xDB460：
+//   lea ecx,[this+0x2C]; push <wchar_t*>; call dword ptr [0x101E71F8]，
+//   0x101E71F8 = ??4?$basic_string@_W...QAEAAV01@PB_W@Z（wstring::operator=(wchar_t*)），
+//   0x101E71F0 = ?c_str@?$basic_string@_W...（wstring::c_str），
+//   0x101E71E0 = ??1?$basic_string@_W...（wstring::~wstring））。
+// 32 位 VS2008/VS2022 wstring 布局一致：_Bx[16B] 起于 +0x2C，size<=7 时内联 8 个 wchar，
+// 否则 _Bx 存堆指针；_Mysize 在 +0x3C，_Myres 在 +0x40。
+// 只接受纯可打印 ASCII（游戏内资源名都是 ASCII）；任何异常一律判失败 → 输出空串，
+// 绝不让"解错的乱码"参与判据（误判≈0 优先）。
+// 尝试把一段 wchar 解码成可打印 ASCII；失败返回 0（out 置空）。
+static int TryDecodeW(const wchar_t* w, uint32_t size, char* out, int cap)
 {
     out[0] = 0;
-    if (!Readable(self, 0x40)) return;
-    uint8_t* p = (uint8_t*)self + 0x2C;
-    if (!Readable(p, 12)) return;
-    uint32_t ptr = *(uint32_t*)p;
-    uint32_t len = *(uint32_t*)(p + 4);
-    if (len == 0 || len > 300 || !Readable((void*)ptr, 4)) {
-        _snprintf_s(out, (size_t)cap, _TRUNCATE, "<raw:%08x %08x %08x>",
-                    ptr, len, *(uint32_t*)(p + 8));
+    if (!w || size == 0) return 0;
+    int n = (int)size;
+    if (n > cap - 1) n = cap - 1;
+    for (int i = 0; i < n; ++i) {
+        unsigned c = (unsigned)w[i];
+        if (c < 0x20 || c > 0x7E) { out[0] = 0; return 0; }
+        out[i] = (char)c;
+    }
+    out[n] = 0;
+    return n;
+}
+
+// 资源名解码（nekoHWMusic+0x2C 是 std::wstring）。
+// 注意：SSO 阈值是“8 个 wchar 的内联缓冲”，但 32 位 MSVC 在 _Myres==0 的对象上
+// 赋一个 7 字符名字时会退化成“容量 7 的堆串”（[实测] tmp\wtest 探针），所以
+// size<=7 时两种布局都要试；只有全 ASCII 才算成功，解不出就返回 0。
+static int DecodeWNameField(void* hw, char* out, int cap)
+{
+    if (!out || cap < 8) return 0;
+    out[0] = 0;
+    if (!hw || !Readable(hw, HWM_RES_OFF + 4)) return 0;
+    const uint8_t* b = (const uint8_t*)hw;
+    uint32_t size = *(const uint32_t*)(b + HWM_SIZE_OFF);
+    uint32_t res  = *(const uint32_t*)(b + HWM_RES_OFF);
+    if (size == 0 || size > 200) return 0;      // 资源名不会超过 200 个 wchar
+    if (res < size || res > 4096) return 0;
+    if (size <= 7) {
+        const wchar_t* inl = (const wchar_t*)(b + HWM_NAME_OFF);
+        if (Readable((void*)inl, (int)(size * 2 + 2))) {
+            int n = TryDecodeW(inl, size, out, cap);
+            if (n) return n;
+        }
+        uint32_t p = *(const uint32_t*)(b + HWM_NAME_OFF);
+        if (p && Readable((void*)p, (int)(size * 2))) {
+            int n = TryDecodeW((const wchar_t*)p, size, out, cap);
+            if (n) return n;
+        }
+        return 0;
+    }
+    uint32_t ptr = *(const uint32_t*)(b + HWM_NAME_OFF);
+    if (!ptr || !Readable((void*)ptr, (int)(size * 2))) return 0;
+    return TryDecodeW((const wchar_t*)ptr, size, out, cap);
+}
+
+// 兼容旧调用点（L3 载入器）：this 即 nekoHWMusic 实例。
+static void ReadNameField(void* self, char* out, int cap)
+{
+    char tmp[256];
+    if (DecodeWNameField(self, tmp, (int)sizeof(tmp))) {
+        _snprintf_s(out, (size_t)cap, _TRUNCATE, "%s", tmp);
         return;
     }
-    int n = (len < (uint32_t)(cap - 1)) ? (int)len : cap - 1;
-    if (Readable((void*)ptr, n)) {
-        const char* s = (const char*)ptr;
-        int printable = 0;
-        for (int i = 0; i < n; ++i) if (s[i] >= 0x20 && s[i] < 0x7F) printable++;
-        if (printable >= n * 8 / 10) { memcpy(out, s, n); out[n] = 0; return; }
-        const wchar_t* w = (const wchar_t*)ptr;
-        int wn = (len / 2 < (uint32_t)(cap - 1)) ? (int)(len / 2) : cap - 1;
-        if (wn > 0 && Readable((void*)ptr, wn * 2)) {
-            int ok = 0;
-            for (int i = 0; i < wn; ++i) if (w[i] >= 0x20 && w[i] < 0x7F) ok++;
-            if (ok >= wn * 8 / 10) {
-                for (int i = 0; i < wn; ++i) out[i] = (char)w[i];
-                out[wn] = 0;
-                return;
-            }
-        }
-    }
-    _snprintf_s(out, (size_t)cap, _TRUNCATE, "<raw:%08x len=%u>", ptr, len);
+    out[0] = 0;
+    if (!Readable(self, HWM_RES_OFF + 4)) return;
+    const uint8_t* b = (const uint8_t*)self;
+    _snprintf_s(out, (size_t)cap, _TRUNCATE, "<raw:%08x %08x %08x>",
+                *(const uint32_t*)(b + HWM_NAME_OFF),
+                *(const uint32_t*)(b + HWM_SIZE_OFF),
+                *(const uint32_t*)(b + HWM_RES_OFF));
+}
+
+// 资源名前缀 → 类别。
+// [实测] nkpack 明文名：Voice.nkpack 2118 条全为 Voices\lucyNNNN[_M]_jp.mp3 / _kr.mp3；
+//        BGM.nkpack 样例 BGMs\c17.mp3 / BGMs\c2.mp3 / BGMs\community.mp3；
+//        FX.nkpack  样例 FXs\airport.mp3 / FXs\alarmclock.mp3 / FXs\bell.mp3。
+static int CatFromName(const char* src)
+{
+    if (!src || !src[0]) return CAT_UNKNOWN;
+    if (_strnicmp(src, "Voices\\", 7) == 0) return CAT_VOICE;
+    if (_strnicmp(src, "BGMs\\",   5) == 0) return CAT_BGM;
+    if (_strnicmp(src, "FXs\\",    4) == 0) return CAT_SFX;
+    if (strstr(src, "Voices\\") || strstr(src, "Voices/")) return CAT_VOICE;
+    if (strstr(src, "BGMs\\")   || strstr(src, "BGMs/"))   return CAT_BGM;
+    if (strstr(src, "FXs\\")    || strstr(src, "FXs/"))    return CAT_SFX;
+    return CAT_UNKNOWN;
 }
 
 // ===================================================== 分类（L1 用） =======
 static int ClassifyName(const char* cls, const char* src)
 {
-    if (src && src[0]) {
-        if (_strnicmp(src, "Voices\\", 7) == 0 || strstr(src, "Voices\\")) return CONF_L1_NAME;
-        if (_strnicmp(src, "voice", 5) == 0) return CONF_L1_NAME;
-        if (strstr(src, "BGM") || strstr(src, "Music") || strstr(src, "bgm")) return CONF_NONE;
-    }
+    int c = CatFromName(src);
+    if (c == CAT_VOICE) return CONF_L1_NAME;
+    if (c == CAT_BGM || c == CAT_SFX) return CONF_NONE;
     if (cls && cls[0]) {
         if (strstr(cls, "Voice")) return CONF_L1_NAME;
-        if (strstr(cls, "BGMusic") || strstr(cls, "Music")) return CONF_NONE;
+        if (strstr(cls, "BGMusic") || strstr(cls, "Music") || strstr(cls, "Sound")) return CONF_NONE;
     }
     return CONF_NONE;   // 认不出 = 不算语音（误判≈0 优先）
 }
@@ -617,12 +697,31 @@ static int   g_l0Installed = 0;
 static void __cdecl OnVoicePlayL0(void* self)
 {
     char nm[256] = {0};
-    char clsRaw[160] = {0};
-    if (Readable(self, 0x74)) {
-        void* hw = *(void**)((uint8_t*)self + 0x70);
-        if (hw && Readable(hw, 0x40)) ReadNameField(hw, nm, sizeof(nm));
+    if (Readable(self, SP_RAW_OFF + 4)) {
+        // 语音实例 +0x70 是内嵌智能指针（vtable 0x101EEF18），裸指针在 +0x74；
+        // play 自己也是先 call 0x5FC00(取 [ecx+4]) 再 call 0xDBB80，所以这里读同一个字段。
+        void* hw = *(void**)((uint8_t*)self + SP_RAW_OFF);
+        HMODULE eng = GetModuleHandleA("Engine.dll");
+        if (hw && Readable(hw, HWM_SIZE)) {
+            void** vt = *(void***)hw;
+            // 正式运行时严格校验 nekoHWMusic 虚表；自检环境没有 Engine.dll，跳过校验
+            int isHw = eng ? (vt == (void**)((uint8_t*)eng + ENGINE_HWMUSIC_VTABLE_RVA)) : 1;
+            if (isHw)
+                DecodeWNameField(hw, nm, sizeof(nm));
+            else
+                _snprintf_s(nm, sizeof(nm), _TRUNCATE, "<not-hwmusic vt=%p>", (void*)vt);
+        }
     }
-    ClassNameOf(self, clsRaw, sizeof(clsRaw));
+    // 名字能读出来时，前缀是最后一道保险：BGMs\ / FXs\ 绝不记成语音
+    int c = CatFromName(nm);
+    if (c == CAT_BGM || c == CAT_SFX) {
+        Log("[audio] NOTE  L0 play 名字非语音，忽略 name=\"%s\"", nm);
+        return;
+    }
+    if (g_requireName && c != CAT_VOICE) {
+        Log("[audio] NOTE  L0 play 名字未确认语音，require_name=1 忽略 name=\"%s\"", nm);
+        return;
+    }
     RecordVoicePlay(CONF_L0, 0, nm);
 }
 
@@ -851,10 +950,14 @@ static void* __stdcall Hook_OpenSound(void* dev, void* src, int streaming)
         break;
     }
     LeaveCriticalSection(&g_cs);
+    InstallStreamVtSpy(os);
     r->conf = ClassifyName(r->cls, r->src);
-    r->cat = r->conf >= CONF_L1_NAME ? CAT_VOICE : CAT_BGM;
-    PatchInstanceVtable(os, r, OS_SLOTS);
-    if (r->ourVt) { r->ourVt[OS_PLAY] = (void*)Thunk_OSPlay; r->ourVt[OS_STOP] = (void*)Thunk_OSStop; }
+    int nc = CatFromName(r->src);
+    r->cat = (nc != CAT_UNKNOWN) ? nc : (r->conf >= CONF_L1_NAME ? CAT_VOICE : CAT_BGM);
+    if (g_l1Vtable) {
+        PatchInstanceVtable(os, r, OS_SLOTS);
+        if (r->ourVt) { r->ourVt[OS_PLAY] = (void*)Thunk_OSPlay; r->ourVt[OS_STOP] = (void*)Thunk_OSStop; }
+    }
     Log("[audio] OPEN  id=%ld t=%u cat=%s conf=%d class=%s src=\"%s\" size=%d magic=%s rate=%d ch=%d dur_ms=%d streaming=%d",
         (long)InterlockedIncrement(&g_idSeq), NowMs(), kCatName[r->cat], r->conf, r->cls, r->src,
         r->size, r->magic, r->rate, r->ch, r->durMs, r->streaming);
@@ -879,8 +982,10 @@ static void* __stdcall Hook_OpenSoundEffect(void* dev, void* src, int type)
         break;
     }
     LeaveCriticalSection(&g_cs);
-    PatchInstanceVtable(se, r, SE_SLOTS);
-    if (r->ourVt) { r->ourVt[SE_PLAY] = (void*)Thunk_SEPlay; }
+    if (g_l1Vtable) {
+        PatchInstanceVtable(se, r, SE_SLOTS);
+        if (r->ourVt) { r->ourVt[SE_PLAY] = (void*)Thunk_SEPlay; }
+    }
     Log("[audio] OPEN  id=%ld t=%u cat=sfx class=%s src=\"%s\" size=%d magic=%s dur_ms=%d type=%d",
         (long)InterlockedIncrement(&g_idSeq), NowMs(), r->cls, r->src, r->size, r->magic, r->durMs, type);
     return se;
@@ -933,7 +1038,8 @@ static int __fastcall Hook_EngineLoader(void* self, void* edx)
     ShortName(clsRaw, cls, sizeof(cls));
     strcpy_s(t_src, sizeof(t_src), nm);
     strcpy_s(t_cls, sizeof(t_cls), cls);
-    Log("[audio] LOAD  t=%u class=%s src=\"%s\"", NowMs(), cls, nm);
+    Log("[audio] LOAD  t=%u class=%s cat=%s src=\"%s\"",
+        NowMs(), cls, kCatName[CatFromName(nm)], nm);
     int r = ((int (__fastcall*)(void*, void*))g_tramp)(self, edx);
     return r;
 }
@@ -966,6 +1072,17 @@ static int InstallEngineLoaderHook(void)
 }
 
 // ===================================================== IAT patch =========
+// Engine.dll imports the audiere entry points under their stdcall-decorated
+// names ("_AdrOpenSound@12"), so an exact match against the plain name never
+// hits and the whole L1 layer silently installed 0/5 hooks.
+static bool ImportNameMatches(const char* imported, const char* plain)
+{
+    if (strcmp(imported, plain) == 0) { return true; }
+    size_t n = strlen(plain);
+    return imported[0] == '_' && strncmp(imported + 1, plain, n) == 0 &&
+           imported[1 + n] == '@';
+}
+
 static bool PatchIATOne(HMODULE mod, const char* dllName, const char* fnName,
                         void* hook, void** origOut)
 {
@@ -985,7 +1102,8 @@ static bool PatchIATOne(HMODULE mod, const char* dllName, const char* fnName,
         for (; oft->u1.AddressOfData; ++oft, ++ft) {
             if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
             IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)(base + oft->u1.AddressOfData);
-            if (strcmp((const char*)ibn->Name, fnName) != 0) continue;
+            if (strcmp((const char*)ibn->Name, fnName) != 0 &&
+                !ImportNameMatches((const char*)ibn->Name, fnName)) continue;
             if (origOut) *origOut = (void*)ft->u1.Function;
             if (hook == NULL) return true;      // 只取原指针
             DWORD old = 0;
@@ -999,6 +1117,193 @@ static bool PatchIATOne(HMODULE mod, const char* dllName, const char* fnName,
 }
 
 // ===================================================== 安装 / 卸载 =======
+// ============================= stream vtable spy (diagnostic, opt-in) =====
+// audiere hands us its OutputStream objects; they all share one class vtable in
+// audiere.dll.  Copying it per instance crashed the game, but patching the
+// shared table once (and jumping through to the original) is a plain function
+// pointer swap.  Slot numbers are unknown for this build, so spy on 3..10 and
+// let the log tell us which one is play().
+static void* g_vtSpyOrig[11];
+static void* g_vtSpyTable = NULL;
+static LONG  g_vtSlotHits[11];
+
+static void __cdecl OnVtSlot(int slot, void* self)
+{
+    if (InterlockedIncrement(&g_vtSlotHits[slot]) <= 6)
+        Log("[audio] VTSLOT %d t=%u obj=%p", slot, NowMs(), self);
+}
+
+#define VTSPY_THUNK(N)                                                        \
+    static void __declspec(naked) Thunk_VtSpy##N(void)                        \
+    {                                                                         \
+        __asm { pushad }                                                      \
+        __asm { push [esp + 24] }        /* self = ECX saved by pushad (thiscall) */  \
+        __asm { push N }                                                      \
+        __asm { call OnVtSlot }                                               \
+        __asm { add  esp, 8 }                                                 \
+        __asm { popad }                                                       \
+        __asm { jmp  dword ptr [g_vtSpyOrig + N * 4] }                         \
+    }
+
+VTSPY_THUNK(3)
+VTSPY_THUNK(4)
+VTSPY_THUNK(5)
+VTSPY_THUNK(6)
+VTSPY_THUNK(7)
+VTSPY_THUNK(8)
+VTSPY_THUNK(9)
+VTSPY_THUNK(10)
+
+static void* const g_vtSpyThunk[11] = {
+    NULL, NULL, NULL,
+    (void*)Thunk_VtSpy3, (void*)Thunk_VtSpy4, (void*)Thunk_VtSpy5,
+    (void*)Thunk_VtSpy6, (void*)Thunk_VtSpy7, (void*)Thunk_VtSpy8,
+    (void*)Thunk_VtSpy9, (void*)Thunk_VtSpy10
+};
+
+static void InstallStreamVtSpy(void* os)
+{
+    if (!g_vtSpy || g_vtSpyTable || !os) return;
+    void** vt = *(void***)os;
+    if (!Readable(vt, 16 * 4)) return;
+    HMODULE aud = GetModuleHandleA("audiere.dll");
+    if (aud) {
+        uint32_t base = (uint32_t)aud, here = (uint32_t)vt;
+        if (here < base || here > base + 0x200000u) {
+            Log("[audio] VTSLOT 表不在 audiere.dll 内 (%p)，跳过", vt);
+            return;
+        }
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(vt, 16 * 4, PAGE_EXECUTE_READWRITE, &old)) return;
+    for (int i = 3; i <= 10; ++i) {
+        g_vtSpyOrig[i] = vt[i];
+        vt[i] = g_vtSpyThunk[i];
+    }
+    VirtualProtect(vt, 16 * 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), vt, 16 * 4);
+    g_vtSpyTable = vt;
+    Log("[audio] NOTE  VTSLOT 已装：audiere OutputStream vtable %p 槽 3..10", vt);
+}
+
+// ======================================= L0b nekoHWMusic static vtable =====
+// Every sound the game loads (music, ambience and - measured - the heroine's
+// voice clips) goes through nekoHWMusic::play.  Patching that one static table
+// entry costs nothing and cannot corrupt an instance, unlike copying instance
+// vtables (which crashed the game, see voice_l1_vtable).
+static void* g_realMusicPlay = NULL;
+static void* g_realMusicStop = NULL;
+static int   g_l0bInstalled  = 0;
+
+// The object that reaches nekoHWMusic::play is the engine's music object, not
+// audiere's OutputStream we recorded at load time; the stream pointer sits in
+// its first fields.  Scan a few dwords for one of our recorded streams.
+static Rec* RecFindByEmbedded(void* obj)
+{
+    unsigned char* p = (unsigned char*)obj;
+    if (!Readable(p, 0x80)) return NULL;
+    for (int off = 0; off < 0x80; off += 4) {
+        void* v = *(void**)(p + off);
+        if (!v) continue;
+        Rec* r = RecFindObj(v);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+static void __cdecl OnMusicPlay(void* self)
+{
+    Rec* r = RecFindObj(self);
+    if (!r) r = RecFindByEmbedded(self);
+    if (!r) { Log("[audio] MUSIC_PLAY t=%u obj=%p (no record)", NowMs(), self); return; }
+    Log("[audio] MUSIC_PLAY t=%u obj=%p size=%d dur_ms=%d rate=%d ch=%d cat=%s magic=%s",
+        NowMs(), self, r->size, r->durMs, r->rate, r->ch, kCatName[r->cat], r->magic);
+
+    // 配音判据（启发式，实测标定）：台词出现后短时间内出现"中等体量、持续 >=1.5 s"的播放
+    //   带配音台词 = LINE_START 后 0~2500 ms 内出现一次 MUSIC_PLAY，且 dur_ms >= 1500、size >= 15000
+    //   打字机音效 size 4~12 KB（dur 0.3~1.3 s）被 size/dur 双阈值排除；BGM 换曲很少与台词起点同刻
+    //   （2）排除"预载爆发"：引擎换场景时会在同一瞬间对一批音源调 play（实测 8 条/2 ms，
+    //        体积从 25 KB 到 1.9 MB 不等），那不是配音；配音是孤立的单次播放。
+    if (g_lineStarted && r->size >= 15000 && r->durMs >= 1500) {
+        static unsigned s_playT[8] = {0};
+        static int      s_playIdx = 0;
+        unsigned now = NowMs();
+        int burst = 0;
+        for (int i = 0; i < 8; ++i) {
+            if (s_playT[i] && (unsigned)(now - s_playT[i]) <= 120) { burst = 1; break; }
+        }
+        s_playT[s_playIdx] = now;
+        s_playIdx = (s_playIdx + 1) & 7;
+        unsigned lag = now - g_lineStart;
+        if (!burst && lag <= 900) {
+            RecordVoicePlay(CONF_HEUR, r->durMs, "");
+            Log("[audio] HEUR_VOICE gen=%u lag_ms=%u size=%d dur_ms=%d",
+                g_gen, lag, r->size, r->durMs);
+        } else if (burst) {
+            Log("[audio] HEUR_SKIP burst gen=%u size=%d dur_ms=%d", g_gen, r->size, r->durMs);
+        }
+    }
+}
+
+static void __cdecl OnMusicStop(void* self)
+{
+    (void)self;
+}
+
+static void __declspec(naked) Thunk_MusicPlay(void)
+{
+    __asm {
+        push ecx
+        push ecx
+        call OnMusicPlay
+        add  esp, 4
+        pop  ecx
+        jmp  dword ptr [g_realMusicPlay]
+    }
+}
+
+static void __declspec(naked) Thunk_MusicStop(void)
+{
+    __asm {
+        push ecx
+        push ecx
+        call OnMusicStop
+        add  esp, 4
+        pop  ecx
+        jmp  dword ptr [g_realMusicStop]
+    }
+}
+
+static int InstallMusicVtableHook(void)
+{
+    HMODULE eng = GetModuleHandleA("Engine.dll");
+    if (!eng) return 0;
+    void** vt = (void**)((uint8_t*)eng + ENGINE_HWMUSIC_VTABLE_RVA);
+    if (!Readable(vt, 16 * 4)) return 0;
+    void* p7 = vt[VS_PLAY];
+    void* p8 = vt[VS_STOP];
+    // The exact entry point differs between engine builds (1.50 shows play at
+    // Engine+0xDB860); only require that both slots point into Engine.dll text.
+    uint32_t r7 = (uint32_t)p7 - (uint32_t)eng;
+    uint32_t r8 = (uint32_t)p8 - (uint32_t)eng;
+    if (r7 < 0x1000u || r7 >= 0x1E5B60u || r8 < 0x1000u || r8 >= 0x1E5B60u) {
+        Log("[audio] NOTE  L0b 版本不符 (slot7=%p rva=0x%X)，跳过", p7, r7);
+        return 0;
+    }
+    Log("[audio] NOTE  L0b 入口 play=Engine+0x%X stop=Engine+0x%X", r7, r8);
+    DWORD old = 0;
+    if (!VirtualProtect(vt, 16 * 4, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    g_realMusicPlay = p7;
+    g_realMusicStop = p8;
+    vt[VS_PLAY] = (void*)Thunk_MusicPlay;
+    vt[VS_STOP] = (void*)Thunk_MusicStop;
+    VirtualProtect(vt, 16 * 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), vt, 16 * 4);
+    g_l0bInstalled = 1;
+    Log("[audio] NOTE  L0b 已装：nekoHWMusic vtable slot7/8 (Engine+0x%X)", ENGINE_HWMUSIC_VTABLE_RVA);
+    return 1;
+}
+
 extern "C" int Audio_Init(void)
 {
     SyncEnsure();
@@ -1035,6 +1340,7 @@ extern "C" int Audio_Init(void)
 
     if (g_enableL3) InstallEngineLoaderHook();     // L3：名字上下文（可选）
     if (g_enableL0) InstallVoiceVtableHook();      // L0：最强判据
+    if (g_enableL0) InstallMusicVtableHook();      // L0b：通用播放记录（实测音乐/环境音/语音都走这里）
     else            Log("[audio] NOTE  L0 被配置关闭 (voice_l0=0)");
 
     if (n == 0 && !g_l0Installed) {
@@ -1135,5 +1441,22 @@ extern "C" int Audio__TestEventCount(void)
     for (int i = 0; i < AUDIO_MAX_EVT; ++i) if (g_evt[i].conf != 0) n++;
     LeaveCriticalSection(&g_cs);
     return n;
+}
+
+extern "C" int Audio__TestDecodeName(const void* p, char* out, int cap)
+{
+    return DecodeWNameField((void*)p, out, cap);
+}
+
+extern "C" int Audio__TestCatFromName(const char* src)
+{
+    return CatFromName(src);
+}
+
+extern "C" int Audio__TestL0Play(const void* self)
+{
+    int before = Audio__TestEventCount();
+    OnVoicePlayL0((void*)self);
+    return Audio__TestEventCount() > before ? 1 : 0;
 }
 #endif

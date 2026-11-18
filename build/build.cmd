@@ -128,12 +128,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo [i] compiling inputhook.cpp
+cl /c %CL% %INC% /Fo"%OUTDIR%\inputhook.obj" "%SRC%\inputhook.cpp" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  echo [x] compile failed: inputhook.cpp - see %LOG%
+  exit /b 1
+)
+
 set LINK_DEBUG=
 if "%DEV_BUILD%"=="1" set LINK_DEBUG=/DEBUG
 
 link /nologo /DLL /MACHINE:X86 %LINK_DEBUG% /OUT:"%OUTDIR%\d3dx9_40.dll" ^
   "%OUTDIR%\a11y.obj" "%OUTDIR%\fonthook.obj" "%OUTDIR%\menus.obj" "%OUTDIR%\proxy.obj" ^
-  "%OUTDIR%\forward.obj" "%OUTDIR%\speech.obj" "%OUTDIR%\audio_hook.obj" ^
+  "%OUTDIR%\forward.obj" "%OUTDIR%\speech.obj" "%OUTDIR%\audio_hook.obj" "%OUTDIR%\inputhook.obj" ^
   user32.lib gdi32.lib ole32.lib oleaut32.lib winmm.lib >>"%LOG%" 2>&1
 if errorlevel 1 (
   echo [x] link failed - see %LOG%

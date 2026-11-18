@@ -1,68 +1,71 @@
 ﻿#Requires -Version 5.1
 <#
-  安装器：把补丁的代理 DLL 装进游戏目录（可干跑、可回滚）。
+  install.ps1 -- 露西 无障碍补丁 安装器（玩家入口，幂等、可干跑、可回滚）
 
-  做法（幂等）：
-    1. 游戏目录里必须有 d3dx9_40.dll；
-    2. 把原文件改名为 d3dx9_40.orig.dll 备份（已有备份 = 已经装过，直接拒绝）；
-    3. 把 dist\d3dx9_40.dll 复制进去；
-    4. 校验复制后的哈希，写安装记录（游戏路径 / 版本 / 两个文件的 SHA256）。
+  做什么：
+    1) 检查：游戏目录里要有 Lucy.exe + Engine.dll；游戏没从该目录运行；
+       d3dx9_40.dll 必须是游戏原版（SHA256 = 16FD909A...E216B）。
+    2) 安装：原文件改名为 d3dx9_40_orig.dll 保留；复制补丁 d3dx9_40.dll；
+       建 a11y\ 目录；包内若有 nvdaControllerClient.dll 一并复制；
+       写 a11y\install.json（版本 / 时间 / 两个 SHA256 / 备份名）。
+    3) 幂等：已装过（install.json 或备份存在）只提示，不覆盖备份。
 
   用法：
     pwsh -File tools\install.ps1 -GameDir "D:\...\Lucy" -DryRun   # 只看不动
     pwsh -File tools\install.ps1 -GameDir "D:\...\Lucy"
+    pwsh -File tools\install.ps1 -GameDir "D:\...\Lucy" -SourceDir "D:\...\发布包"
 
-  注意：本脚本不会、也不应该由仓库维护者对本机游戏目录直接执行；
-        游戏目录由玩家自己的机器指定，仓库测试一律只跑 -DryRun。
+  退出码：0 = 成功或无需动作；1 = 检查失败或出错（会写清原因）。
+  不装服务、不写注册表、不需要管理员权限；只动指定游戏目录。
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$GameDir,
-    [string]$SourceDll = "",
+    [Parameter(Mandatory = $false)][string]$GameDir = "",
+    [Parameter(Mandatory = $false)][string]$SourceDir = "",
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
-$RepoRoot = Split-Path -Parent $PSScriptRoot
-$BackupName = "d3dx9_40.orig.dll"
+
 $TargetName = "d3dx9_40.dll"
+$BackupName = "d3dx9_40_orig.dll"
+$EngineExe = "Lucy.exe"
+$EngineDll = "Engine.dll"
+# 中文版 Ver 1.14 的 d3dx9_40.dll 原版哈希（实测）。
+$OriginalSha256 = "16FD909AEB68D0D1ACA8529DC7F78880B97D6649D70CE8D03A2C858BC28E216B"
 
-function Get-RecordDir {
-    $base = $env:LOCALAPPDATA
-    if ([string]::IsNullOrEmpty($base)) { $base = Join-Path $env:USERPROFILE "AppData\Local" }
-    $dir = Join-Path $base "LucyForAccessibility"
-    return $dir
+if ([string]::IsNullOrEmpty($SourceDir)) {
+    # 默认：脚本所在包的上一级（发布包根目录 / 仓库根目录）。
+    $SourceDir = Split-Path -Parent $PSScriptRoot
 }
-$RecordDir = Get-RecordDir
-$RecordPath = Join-Path $RecordDir "install.json"
-$LogPath = Join-Path $RecordDir "install.log"
 
-$script:logLines = New-Object System.Collections.Generic.List[string]
+$log = New-Object System.Collections.Generic.List[string]
 function Say([string]$m) {
-    $prefix = ""
-    if ($DryRun) { $prefix = "[dry] " }
-    $line = "$prefix$m"
-    Write-Host $line
-    $script:logLines.Add($line)
+    if ($DryRun) { $m = "[dry] $m" }
+    Write-Host $m
+    $script:log.Add($m)
+}
+function Warn([string]$m) {
+    Write-Host "[warn] $m" -ForegroundColor Yellow
+    $script:log.Add("[warn] $m")
 }
 function Fail([string]$m) {
-    $line = "[x] $m"
-    Write-Host $line -ForegroundColor Red
-    $script:logLines.Add($line)
-    # 失败时也把日志落盘，方便排查（干跑除外）。
-    if (-not $DryRun) {
-        try {
-            New-Item -ItemType Directory -Force -Path $RecordDir | Out-Null
-            Add-Content -LiteralPath $LogPath -Value $script:logLines -Encoding UTF8
-        } catch { }
-    }
+    Write-Host "[x] $m" -ForegroundColor Red
+    $script:log.Add("[x] $m")
     exit 1
 }
 function Get-Sha256([string]$path) {
-    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
 function Get-PatchVersion {
-    $vh = Join-Path $RepoRoot "src\version.h"
+    # 优先读发布包里的 CHANGELOG.md 第一个版本标题；仓库里也认 src\version.h。
+    $cl = Join-Path $SourceDir "CHANGELOG.md"
+    if (Test-Path -LiteralPath $cl) {
+        $t = Get-Content -LiteralPath $cl -Raw -Encoding UTF8
+        $m = [regex]::Match($t, '(?m)^##\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)')
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    $vh = Join-Path (Split-Path -Parent $PSScriptRoot) "src\version.h"
     if (Test-Path -LiteralPath $vh) {
         $t = Get-Content -LiteralPath $vh -Raw -Encoding UTF8
         $m = [regex]::Match($t, '(?m)^\s*#\s*define\s+A11Y_VERSION\s+"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"?')
@@ -77,97 +80,155 @@ if ($DryRun) { Write-Host "   干跑模式：只打印步骤，不改任何文�
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# 1. 检查游戏目录与源文件
+# 1. 游戏目录检查
 # ---------------------------------------------------------------------------
-if (-not (Test-Path -LiteralPath $GameDir -PathType Container)) {
-    Fail "游戏目录不存在：$GameDir"
-}
+if ([string]::IsNullOrEmpty($GameDir)) { Fail "请用 -GameDir 指定游戏安装目录。" }
+if (-not (Test-Path -LiteralPath $GameDir -PathType Container)) { Fail "游戏目录不存在：$GameDir" }
 $GameDirFull = (Resolve-Path -LiteralPath $GameDir).Path.TrimEnd('\')
+if (-not (Test-Path -LiteralPath (Join-Path $GameDirFull $EngineExe) -PathType Leaf)) {
+    Fail "这个目录里没有 $EngineExe，看起来不是《露西 -她所期望的一切-》的游戏目录：$GameDirFull"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $GameDirFull $EngineDll) -PathType Leaf)) {
+    Fail "这个目录里没有 $EngineDll，游戏文件不完整或目录选错了：$GameDirFull"
+}
+
+# ---------------------------------------------------------------------------
+# 2. 游戏是否正从该目录运行（只拒绝该目录的进程，别的副本在跑不影响）
+# ---------------------------------------------------------------------------
+$ourExe = (Join-Path $GameDirFull $EngineExe)
+foreach ($p in @(Get-Process -Name ([System.IO.Path]::GetFileNameWithoutExtension($EngineExe)) -ErrorAction SilentlyContinue)) {
+    $ppath = $null
+    try { $ppath = $p.Path } catch { $ppath = $null }
+    if ($ppath -and ($ppath.TrimEnd('\') -ieq $ourExe.TrimEnd('\'))) {
+        Fail "游戏正在运行（进程 $($p.Id)）。请先完全退出游戏再安装。"
+    }
+}
+
 $target = Join-Path $GameDirFull $TargetName
 $backup = Join-Path $GameDirFull $BackupName
+$a11yDir = Join-Path $GameDirFull "a11y"
+$recordPath = Join-Path $a11yDir "install.json"
+$installLog = Join-Path $a11yDir "install.log"
 
-if ([string]::IsNullOrEmpty($SourceDll)) {
-    $SourceDll = Join-Path $RepoRoot "dist\$TargetName"
+# ---------------------------------------------------------------------------
+# 3. 补丁源文件检查
+# ---------------------------------------------------------------------------
+$sourceDll = Join-Path $SourceDir $TargetName
+if (-not (Test-Path -LiteralPath $sourceDll -PathType Leaf)) {
+    Fail "找不到补丁文件：$sourceDll`n      请先解压发布包，或用 -SourceDir 指向补丁所在目录（里面有 $TargetName）。"
 }
-if (-not (Test-Path -LiteralPath $SourceDll -PathType Leaf)) {
-    Fail "找不到补丁文件：$SourceDll`n      请先构建（build\build.cmd）或解压发布包，把 d3dx9_40.dll 放到 dist\ 下。"
-}
-$SourceDllFull = (Resolve-Path -LiteralPath $SourceDll).Path
-if ((Get-Item -LiteralPath $SourceDllFull).Length -le 0) {
-    Fail "补丁文件是空的：$SourceDllFull"
+$sourceDll = (Resolve-Path -LiteralPath $sourceDll).Path
+if ((Get-Item -LiteralPath $sourceDll).Length -le 0) { Fail "补丁文件是空的：$sourceDll" }
+$patchHash = Get-Sha256 $sourceDll
+if ($patchHash -eq $OriginalSha256) {
+    Fail "补丁文件与游戏原版一模一样（$sourceDll），这不是补丁，拒绝安装。"
 }
 
-if (Test-Path -LiteralPath $backup) {
-    Fail "这个游戏目录已经装过补丁（存在 $BackupName）。`n      请先运行 tools\uninstall.ps1 还原，再安装。"
+# ---------------------------------------------------------------------------
+# 4. 当前安装状态
+# ---------------------------------------------------------------------------
+$version = Get-PatchVersion
+$alreadyInstalled = (Test-Path -LiteralPath $recordPath) -or (Test-Path -LiteralPath $backup)
+if ($alreadyInstalled) {
+    Say "这个游戏目录已经装过补丁：$GameDirFull"
+    Say "  备份文件：$backup"
+    Say "  安装记录：$recordPath"
+    Say "无需重复安装；要换版本请先运行 tools\uninstall.ps1 还原，再重新安装。"
+    exit 0
 }
 if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
-    Fail "游戏目录里没有 $TargetName：$GameDirFull`n      可能选错了目录，或游戏版本与本补丁不匹配。"
+    Fail "游戏目录里没有 $TargetName。`n      游戏文件不完整；请先用 Steam「验证游戏文件完整性」修复。"
 }
 
-$version = Get-PatchVersion
-$originalHash = Get-Sha256 $target
-$patchHash = Get-Sha256 $SourceDllFull
+$currentHash = Get-Sha256 $target
+if ($currentHash -ne $OriginalSha256) {
+    if ($currentHash -eq $patchHash) {
+        Say "这个目录里已经是本补丁的 $TargetName（没有安装记录，可能是手动装过）。"
+        Say "无需重复安装；要还原请运行 tools\uninstall.ps1 -GameDir `"$GameDirFull`"。"
+        exit 0
+    }
+    Fail ("游戏目录里的 $TargetName 不是原版文件（SHA256=$currentHash）。`n" +
+          "      可能装了别的补丁、或文件已损坏；为避免覆盖，拒绝安装。`n" +
+          "      请先用 Steam「验证游戏文件完整性」恢复原文件后再试。")
+}
 
 Say "游戏目录：$GameDirFull"
 Say "补丁版本：$version"
-Say "原文件  ：$TargetName  SHA256=$originalHash"
-Say "补丁文件：$SourceDllFull  SHA256=$patchHash"
+Say "原文件  ：$TargetName  SHA256=$OriginalSha256（原版已确认）"
+Say "补丁文件：$sourceDll  SHA256=$patchHash"
 
 # ---------------------------------------------------------------------------
-# 2. 干跑：只打印计划
+# 5. 干跑
 # ---------------------------------------------------------------------------
+$nvdaCandidates = @(
+    (Join-Path $SourceDir "nvdaControllerClient.dll"),
+    (Join-Path $SourceDir "a11y\nvdaControllerClient.dll"),
+    (Join-Path $SourceDir "dll\nvdaControllerClient.dll")
+)
+$nvdaSource = $null
+foreach ($c in $nvdaCandidates) { if (Test-Path -LiteralPath $c -PathType Leaf) { $nvdaSource = $c; break } }
+
 if ($DryRun) {
     Say "将执行："
-    Say "  1) 改名 $TargetName -> $BackupName"
-    Say "  2) 复制 $SourceDllFull -> $GameDirFull\$TargetName"
+    Say "  1) 改名 $TargetName -> $BackupName（保留原文件）"
+    Say "  2) 复制 $sourceDll -> $GameDirFull\$TargetName"
     Say "  3) 校验复制后的 SHA256"
-    Say "  4) 写安装记录 $RecordPath"
+    Say "  4) 建目录 $a11yDir"
+    if ($nvdaSource) { Say "  5) 复制 $nvdaSource -> $a11yDir\nvdaControllerClient.dll" }
+    else { Say "  5) 包内没有 nvdaControllerClient.dll，跳过（运行时从本机 NVDA 目录加载）" }
+    Say "  6) 写安装记录 $recordPath"
     Write-Host ""
     Write-Host "干跑结束，未改动任何文件。" -ForegroundColor Green
     exit 0
 }
 
 # ---------------------------------------------------------------------------
-# 3. 实际安装（失败自动回滚）
+# 6. 实际安装（失败自动回滚）
 # ---------------------------------------------------------------------------
 $backupDone = $false
 $copyDone = $false
 try {
-    New-Item -ItemType Directory -Force -Path $RecordDir | Out-Null
     Say "改名备份：$TargetName -> $BackupName"
     Rename-Item -LiteralPath $target -NewName $BackupName -ErrorAction Stop
     $backupDone = $true
 
-    Say "复制补丁：$SourceDllFull -> $target"
-    Copy-Item -LiteralPath $SourceDllFull -Destination $target -Force -ErrorAction Stop
+    Say "复制补丁：$sourceDll -> $target"
+    Copy-Item -LiteralPath $sourceDll -Destination $target -Force -ErrorAction Stop
     $copyDone = $true
 
     $newHash = Get-Sha256 $target
-    if ($newHash -ne $patchHash) {
-        throw "复制后哈希不符：期望 $patchHash，实际 $newHash"
-    }
+    if ($newHash -ne $patchHash) { throw "复制后哈希不符：期望 $patchHash，实际 $newHash" }
     Say "哈希校验通过：$newHash"
+
+    New-Item -ItemType Directory -Force -Path $a11yDir | Out-Null
+    Say "已建目录：$a11yDir"
+
+    if ($nvdaSource) {
+        Copy-Item -LiteralPath $nvdaSource -Destination (Join-Path $a11yDir "nvdaControllerClient.dll") -Force
+        Say "已复制 nvdaControllerClient.dll 到 a11y\"
+    } else {
+        Say "包内没有 nvdaControllerClient.dll，跳过（运行时从本机 NVDA 目录加载）"
+    }
 
     $record = [ordered]@{
         tool           = "LucyForAccessibility"
         schema         = 1
-        gameDir        = $GameDirFull
-        patchVersion   = $version
+        version        = $version
         installedAt    = (Get-Date).ToString("yyyy-MM-ddTHH:mm:sszzz")
-        targetName     = $TargetName
-        backupName     = $BackupName
-        originalSha256 = $originalHash
+        gameDir        = $GameDirFull
+        originalSha256 = $OriginalSha256
         patchSha256    = $patchHash
-        sourceDll      = $SourceDllFull
+        backupName     = $BackupName
+        sourceDll      = $sourceDll
     }
-    $tmp = "$RecordPath.tmp"
+    $tmp = "$recordPath.tmp"
     $record | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tmp -Encoding UTF8
-    Move-Item -LiteralPath $tmp -Destination $RecordPath -Force
-    Say "安装记录已写：$RecordPath"
+    Move-Item -LiteralPath $tmp -Destination $recordPath -Force
+    Say "安装记录已写：$recordPath"
 
-    Add-Content -LiteralPath $LogPath -Value $script:logLines -Encoding UTF8
+    Add-Content -LiteralPath $installLog -Value $script:log -Encoding UTF8
     Write-Host ""
-    Write-Host "安装完成。启动游戏即可；没声音请查看 docs\常见问题.md。" -ForegroundColor Green
+    Write-Host "安装完成。启动游戏即可；听不到声音请看 docs\常见问题.md。" -ForegroundColor Green
     exit 0
 } catch {
     Write-Host ""
@@ -179,5 +240,6 @@ try {
         try { Rename-Item -LiteralPath $backup -NewName $TargetName -ErrorAction Stop }
         catch { Write-Host "[!] 回滚改名失败，请手动把 $BackupName 改回 $TargetName" -ForegroundColor Red }
     }
+    if (Test-Path -LiteralPath $recordPath) { Remove-Item -LiteralPath $recordPath -Force -ErrorAction SilentlyContinue }
     Fail "安装失败并已回滚：$($_.Exception.Message)"
 }
