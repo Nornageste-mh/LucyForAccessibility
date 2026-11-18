@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 //  audio_hook.cpp -- Lucy (nkNovel 1.50) 配音判据模块 · GalA11y Forge
 //
 //  构建（32 位 /MT，编进 d3dx9_40 代理 DLL）：
@@ -179,7 +179,7 @@ static int g_minPlayedMs  = DEF_MIN_PLAYED_MS;
 static int g_minDurMs     = DEF_MIN_DUR_MS;
 static int g_minConf      = DEF_MIN_CONF;
 static int g_enableL0     = 1;     // voice_l0=0 可关（分阶段验证用）
-static int g_enableL1     = 0;     // voice_l1=0 可关
+static int g_enableL1     = 1;     // voice_l1=0 可关（OPEN 记录 + IAT 打补丁；默认开，判据依赖它）
 static int g_enableL3     = 1;     // voice_l3=0 可关（改 .text 的内联 hook）
 static int g_requireName  = 0;     // voice_require_name=1：L0 还要求资源名以 Voices\ 开头
 static int g_l1Vtable     = 0;     // voice_l1_vtable=1：L1 修补实例 vtable（实测在游戏内会 c0000005 崩溃，默认关）
@@ -234,7 +234,7 @@ static void LoadConfig(HMODULE self)
     g_minConf     = Clamp(IniInt("voice_min_conf",      DEF_MIN_CONF),        1, 3);
     g_logEnabled  = IniInt("voice_log", DEF_LOG) ? 1 : 0;
     g_enableL0    = IniInt("voice_l0", 1) ? 1 : 0;
-    g_enableL1    = IniInt("voice_l1", 0) ? 1 : 0;
+    g_enableL1    = IniInt("voice_l1", 1) ? 1 : 0;
     g_enableL3    = IniInt("voice_l3", 1) ? 1 : 0;
     g_requireName = IniInt("voice_require_name", 0) ? 1 : 0;
 g_l1Vtable    = IniInt("voice_l1_vtable", 0) ? 1 : 0;
@@ -798,7 +798,9 @@ static PFN_OpenDevice               real_OpenDevice = NULL;
 static int g_l1Installed = 0;
 
 struct FileRec { void* file; int size; char magic[8]; int inUse; };
-static FileRec g_file[64];
+#define FILE_MAX 64
+static FileRec g_file[FILE_MAX];
+static volatile LONG g_fileNext;   // FIFO ring: never exhausts on long sessions
 
 struct SrcRec { void* src; int size; int rate; int ch; int durMs; char magic[8]; int fmt; int inUse; };
 static SrcRec g_src[64];
@@ -820,6 +822,7 @@ struct Rec {
     int    fmt;
     char   magic[8];
     int    inUse;
+    DWORD  usedTick;   // for recycling when the table is full (long sessions)
 };
 static Rec g_rec[AUDIO_MAX_REC];
 static volatile LONG g_idSeq = 0;
@@ -846,7 +849,20 @@ static Rec* RecAlloc(void)
     Rec* r = NULL;
     EnterCriticalSection(&g_cs);
     for (int i = 0; i < AUDIO_MAX_REC; ++i)
-        if (!g_rec[i].inUse) { r = &g_rec[i]; ZeroMemory(r, sizeof(*r)); r->inUse = 1; break; }
+        if (!g_rec[i].inUse) { r = &g_rec[i]; break; }
+    if (!r) {
+        // Table full (long session): recycle the least recently allocated slot.
+        // Without this the voice judge silently stops working after 256 loads.
+        DWORD oldest = g_rec[0].usedTick;
+        r = &g_rec[0];
+        for (int i = 1; i < AUDIO_MAX_REC; ++i)
+            if ((LONG)(g_rec[i].usedTick - oldest) < 0) { oldest = g_rec[i].usedTick; r = &g_rec[i]; }
+        static int s_warned;
+        if (!s_warned) { s_warned = 1; LeaveCriticalSection(&g_cs); Log("[audio] NOTE rec table full (%d), recycling oldest slot", AUDIO_MAX_REC); EnterCriticalSection(&g_cs); }
+    }
+    ZeroMemory(r, sizeof(*r));
+    r->inUse = 1;
+    r->usedTick = GetTickCount();
     LeaveCriticalSection(&g_cs);
     return r;
 }
@@ -867,11 +883,10 @@ static void* __stdcall Hook_CreateMemoryFile(const void* buf, int size)
     void* f = real_CreateMemoryFile(buf, size);
     if (f) {
         EnterCriticalSection(&g_fileCs);
-        for (int i = 0; i < 64; ++i) if (!g_file[i].inUse) {
-            g_file[i].inUse = 1; g_file[i].file = f; g_file[i].size = size;
-            SniffMagic(buf, size, g_file[i].magic);
-            break;
-        }
+        LONG slot = (g_fileNext + 1) % FILE_MAX;
+        g_fileNext = slot;
+        g_file[slot].inUse = 1; g_file[slot].file = f; g_file[slot].size = size;
+        SniffMagic(buf, size, g_file[slot].magic);
         LeaveCriticalSection(&g_fileCs);
     }
     return f;

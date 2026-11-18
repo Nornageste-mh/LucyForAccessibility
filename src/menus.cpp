@@ -1,4 +1,4 @@
-﻿// menus.cpp -- keyboard access for a mouse-only UI.
+// menus.cpp -- keyboard access for a mouse-only UI.
 //
 // Measured fact (recon-keys, 2026-11-18): the title screen, pause menu, settings,
 // save/load, backlog, extras and every confirmation box ignore the keyboard
@@ -174,6 +174,12 @@ static const ScreenDef g_screens[SCR_COUNT] = {
 };
 
 static HWND g_wnd;
+
+// Menu rectangles were measured on the game's default 1280x720 client area.
+// MenuInit records the real client size; click points are scaled from that
+// design space so a resized window cannot make us click a neighbouring item.
+static int g_cliW = 1280;
+static int g_cliH = 720;
 static int g_screen = SCR_TITLE;
 static int g_prev = SCR_TITLE;
 static int g_sel;
@@ -272,6 +278,16 @@ static void ClickOnce(POINT screenPt)
     if (g_wnd && InputHookReady()) {
         POINT cp = screenPt;
         ScreenToClient(g_wnd, &cp);
+        // design space (1280x720) -> real client pixels, measured now
+        RECT rcNow;
+        if (GetClientRect(g_wnd, &rcNow) && rcNow.right > 0 && rcNow.bottom > 0) {
+            g_cliW = rcNow.right;
+            g_cliH = rcNow.bottom;
+        }
+        if (g_cliW != 1280 || g_cliH != 720) {
+            cp.x = (LONG)((long)cp.x * g_cliW / 1280);
+            cp.y = (LONG)((long)cp.y * g_cliH / 720);
+        }
         if (InputClickAt(cp.x, cp.y)) {
             Logf(L"menu: click queued client=%ld,%ld", cp.x, cp.y);
         } else {
@@ -505,13 +521,21 @@ void MenuInit(HWND w)
     g_wnd = w;
     g_screen = SCR_TITLE;
     g_sel = 0;
+    RECT rc;
+    if (w && GetClientRect(w, &rc)) {
+        Logf(L"menu: init, window=%p client=%ldx%ld (may still be the initial "
+             L"size; click coordinates use the size at click time)", (void*)w, rc.right, rc.bottom);
+    } else {
+        Logf(L"menu: init, window=%p", (void*)w);
+    }
     InputHookInit(w);
-    Logf(L"menu: init, window=%p", (void*)w);
 }
 
 void MenuSetGameWnd(HWND w) { g_wnd = w; }
 int MenuScreen(void) { return g_screen; }
 int MenuConsumedKey(void) { return g_consumed; }
+
+static DWORD s_screenMuteUntil = 0;
 
 void MenuSetScreen(int screen)
 {
@@ -521,6 +545,11 @@ void MenuSetScreen(int screen)
     g_screen = screen;
     g_sel = 0;
     g_confirmPending = -1;
+    // The engine fades a new page in for the better part of a second.  Keys that
+    // arrive during the fade belong to nobody: they must not be interpreted as
+    // input for a page the player cannot see yet (0.2.4.0 bug: a fast Enter on the
+    // save page activated a slot while the page was still fading in).
+    s_screenMuteUntil = GetTickCount() + 700;
     if (g_suppressName) { g_suppressName = 0; return; }
     switch (screen) {
     case SCR_PAUSE: SpeakMenu(L"暂停菜单"); break;
@@ -558,6 +587,12 @@ void MenuOnKey(int vk, int isDown)
     if (InputClickBusy() && g_screen != SCR_NOVEL && g_screen != SCR_HELP &&
         g_screen != SCR_BACKLOG) {
         Logf(L"menu: click in progress, key %d ignored", vk);
+        return;
+    }
+    // Page still fading in: swallow keys so nobody activates an invisible item.
+    if (g_screen != SCR_NOVEL && g_screen != SCR_HELP && g_screen != SCR_BACKLOG &&
+        (long)(GetTickCount() - s_screenMuteUntil) < 0) {
+        Logf(L"menu: screen settling, key %d ignored", vk);
         return;
     }
     const ScreenDef* s = Cur();

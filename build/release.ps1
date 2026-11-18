@@ -171,14 +171,28 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stage "tools") | Out-Null
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
 Copy-Item -LiteralPath $dll -Destination (Join-Path $stage "d3dx9_40.dll") -Force
+# 产物目前不带版本资源（已知限制），至少让包里有可核对的版本号文件。
+$verTxt = "LucyForAccessibility $Version`r`n" +
+          "built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n" +
+          "dll sha256: " + (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash + "`r`n"
+Set-Content -LiteralPath (Join-Path $stage "VERSION.txt") -Value $verTxt -Encoding UTF8
 foreach ($f in @("README.md", "CHANGELOG.md", "LICENSE", "NOTICE.md")) {
     $src = Join-Path $Root $f
     if (-not (Test-Path -LiteralPath $src)) { Die "发布必需文件缺失：$f" }
     Copy-Item -LiteralPath $src -Destination (Join-Path $stage $f) -Force
 }
 $docDir = Join-Path $Root "docs"
+# 只打包给玩家看的文档；project_status.md / AUDIT-*.md 是内部资料，不进发布包。
+$playerDocs = @("安装说明.md", "常见问题.md", "操作约定.md", "交互形态判定.md")
 if (Test-Path -LiteralPath $docDir) {
-    Copy-Item -Path (Join-Path $docDir "*.md") -Destination (Join-Path $stage "docs") -Force
+    foreach ($d in $playerDocs) {
+        $src = Join-Path $docDir $d
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination (Join-Path $stage "docs") -Force
+        } else {
+            Die "发布必需文档缺失：docs\$d"
+        }
+    }
 }
 foreach ($t in @("install.ps1", "uninstall.ps1")) {
     $src = Join-Path $Root "tools\$t"
@@ -196,6 +210,16 @@ Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
 }
 if ($forbidden.Count -gt 0) {
     Die "发布目录含禁止文件：`n  $($forbidden -join "`n  ")"
+}
+# 清掉旧版本的 zip 与 release_stage，避免 dist/ 里混着历史包。
+Get-ChildItem -LiteralPath $dist -Filter 'LucyForAccessibility-*.zip' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne "LucyForAccessibility-$Version.zip" } |
+    ForEach-Object { Write-Ok "清理旧发布包：$($_.Name)"; Remove-Item -LiteralPath $_.FullName -Force }
+$stageRoot = Join-Path $Root "build\release_stage"
+if (Test-Path -LiteralPath $stageRoot) {
+    Get-ChildItem -LiteralPath $stageRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne $Version } |
+        ForEach-Object { Write-Ok "清理旧发布目录：$($_.Name)"; Remove-Item -LiteralPath $_.FullName -Recurse -Force }
 }
 Write-Ok "发布目录就绪：$stage"
 

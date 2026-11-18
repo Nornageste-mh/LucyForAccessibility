@@ -33,13 +33,37 @@ static void BuildOrigPath(void)
     GetModuleFileNameW(0, self, MAX_PATH);
     wchar_t* slash = wcsrchr(self, L'\\');
     if (slash) { *slash = 0; }
-    wsprintfW(g_origPath, L"%s\\d3dx9_40_orig.dll", self);
+    _snwprintf_s(g_origPath, _countof(g_origPath), _TRUNCATE, L"%s\\d3dx9_40_orig.dll", self);
 }
 
 // Called from the generated lazy trampolines the first time an entry point is
 // used.  By then the loader lock is gone, so LoadLibrary is safe here.
+// ---------------------------------------------------------------- startup ---
+// Nothing heavy may run inside DllMain (loader lock): no file IO, no config
+// writes, no CreateThread.  DllMain only records paths; the first forwarded
+// D3DX call (which happens on the game's own thread, after load) kicks off the
+// real initialisation.  Same order the speech layer documents in speech.h.
+static HMODULE  g_selfMod;
+static wchar_t  g_baseDir[MAX_PATH];
+static volatile LONG g_initState;   // 0 = not started, 1 = running, 2 = done
+
+static void EnsureStarted(void)
+{
+    if (InterlockedCompareExchange(&g_initState, 1, 0) != 0) {
+        while (InterlockedCompareExchange(&g_initState, 2, 2) != 2) { Sleep(5); }
+        return;
+    }
+    LogInit(g_baseDir);
+    Logf(L"=== Lucy accessibility patch %s loaded (pid %lu) ===", A11Y_VERSION,
+         GetCurrentProcessId());
+    ConfigLoad();
+    StartA11y(g_selfMod);
+    InterlockedExchange(&g_initState, 2);
+}
+
 extern "C" void* proxy_resolve(const char* name)
 {
+    EnsureStarted();
     if (!g_resCsReady) {
         InitializeCriticalSection(&g_resCs);
         g_resCsReady = 1;
@@ -106,16 +130,11 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID)
     if (reason != DLL_PROCESS_ATTACH) { return TRUE; }
     DisableThreadLibraryCalls(self);
 
-    wchar_t dir[MAX_PATH];
-    GetModuleFileNameW(self, dir, MAX_PATH);
-    for (wchar_t* p = dir + wcslen(dir); p > dir; --p) {
+    g_selfMod = self;
+    GetModuleFileNameW(self, g_baseDir, MAX_PATH);
+    for (wchar_t* p = g_baseDir + wcslen(g_baseDir); p > g_baseDir; --p) {
         if (*p == L'\\') { *p = 0; break; }
     }
-
-    LogInit(dir);
-    Logf(L"=== Lucy accessibility patch %s loaded (pid %lu) ===", A11Y_VERSION,
-         GetCurrentProcessId());
-    ConfigLoad();
 
     forward_install_defaults();
     BuildOrigPath();
@@ -128,7 +147,6 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID)
     (void)p_D3DXCreateFontIndirectW;
     (void)p_D3DXCreateFontIndirectA;
 
-    StartA11y(self);
     return TRUE;
 }
 

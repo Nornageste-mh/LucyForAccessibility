@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <wctype.h>
 
 A11yConfig g_cfg;
 
@@ -34,14 +35,35 @@ static void EnsureDir(const wchar_t* path)
 void LogInit(const wchar_t* baseDir)
 {
     InitializeCriticalSection(&g_logCs);
-    wsprintfW(g_dataDir, L"%s\\a11y", baseDir);
+    _snwprintf_s(g_dataDir, _countof(g_dataDir), _TRUNCATE, L"%s\\a11y", baseDir);
     EnsureDir(g_dataDir);
-    wsprintfW(g_logPath, L"%s\\%s", g_dataDir, A11Y_LOG_NAME);
+    _snwprintf_s(g_logPath, _countof(g_logPath), _TRUNCATE, L"%s\\%s", g_dataDir, A11Y_LOG_NAME);
+    // Keep the log bounded: rename to a11y.log.1 when it grows past 4 MB so a
+    // long session cannot fill the disk (audit S1).
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(g_logPath, GetFileExInfoStandard, &fad) &&
+            fad.nFileSizeHigh == 0 && fad.nFileSizeLow > (4u * 1024u * 1024u)) {
+            wchar_t old[MAX_PATH];
+            _snwprintf_s(old, _countof(old), _TRUNCATE, L"%s.1", g_logPath);
+            DeleteFileW(old);
+            MoveFileW(g_logPath, old);
+        }
+    }
     g_log = _wfopen(g_logPath, L"ab");
     if (g_log) {
         // Write UTF-8 ourselves: the speech layer appends to the same file and
-        // both writers must produce identical encoding.
-        if (ftell(g_log) == 0) {
+        // both writers must produce identical encoding.  BOM only when the file
+        // is empty (ftell is unreliable on append streams, use the file size).
+        LARGE_INTEGER sz;
+        sz.QuadPart = 0;
+        HANDLE h = CreateFileW(g_logPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            GetFileSizeEx(h, &sz);
+            CloseHandle(h);
+        }
+        if (sz.QuadPart == 0) {
             const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
             fwrite(bom, 1, 3, g_log);
         }
@@ -87,6 +109,39 @@ static void Trim(wchar_t* s)
     }
 }
 
+// Accepts "8", "0x08", "Backspace", "F9", "A" ... and returns a virtual-key code.
+static int ParseVk(const wchar_t* val, int base)
+{
+    if (!val || !*val) { return base; }
+    wchar_t v[32];
+    wcsncpy_s(v, _countof(v), val, _TRUNCATE);
+    for (int i = 0; v[i]; i++) { v[i] = (wchar_t)towupper(v[i]); }
+    if (!wcsncmp(v, L"0X", 2)) {
+        int n = (int)wcstol(v + 2, 0, 16);
+        return (n >= 8 && n <= 254) ? n : base;
+    }
+    int n = _wtoi(v);
+    if (n >= 8 && n <= 254) { return n; }
+    struct Named { const wchar_t* name; int vk; };
+    static const Named kNames[] = {
+        { L"BACKSPACE", VK_BACK }, { L"BACK", VK_BACK }, { L"TAB", VK_TAB },
+        { L"ENTER", VK_RETURN }, { L"ESC", VK_ESCAPE }, { L"ESCAPE", VK_ESCAPE },
+        { L"SPACE", VK_SPACE }, { L"HOME", VK_HOME }, { L"END", VK_END },
+        { L"INSERT", VK_INSERT }, { L"DELETE", VK_DELETE },
+    };
+    for (int i = 0; i < (int)(sizeof(kNames) / sizeof(kNames[0])); i++) {
+        if (!wcscmp(v, kNames[i].name)) { return kNames[i].vk; }
+    }
+    if (v[0] == L'F' && v[1] >= L'1' && v[1] <= L'9') {
+        int fn = _wtoi(v + 1);
+        if (fn >= 1 && fn <= 24) { return VK_F1 + fn - 1; }
+    }
+    if (!v[1] && ((v[0] >= L'A' && v[0] <= L'Z') || (v[0] >= L'0' && v[0] <= L'9'))) {
+        return (int)v[0];
+    }
+    return base;
+}
+
 void ConfigLoad(void)
 {
     // defaults
@@ -103,7 +158,7 @@ void ConfigLoad(void)
     g_cfg.keyBackend = VK_F9;
 
     wchar_t path[MAX_PATH];
-    wsprintfW(path, L"%s\\%s", g_dataDir, A11Y_INI_NAME);
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s\\%s", g_dataDir, A11Y_INI_NAME);
     FILE* f = _wfopen(path, L"rb");
     if (!f) {
         ConfigSave();
@@ -126,6 +181,8 @@ void ConfigLoad(void)
         else if (!_wcsicmp(key, L"speak_voiced_lines")) { g_cfg.speakVoicedLines = _wtoi(val); }
         else if (!_wcsicmp(key, L"min_stable_ms")) { g_cfg.minStableMs = _wtoi(val); }
         else if (!_wcsicmp(key, L"log_draws")) { g_cfg.logDraws = _wtoi(val); }
+        else if (!_wcsicmp(key, L"re_read_key")) { g_cfg.keyRepeat = ParseVk(val, g_cfg.keyRepeat); }
+        else if (!_wcsicmp(key, L"backend_key")) { g_cfg.keyBackend = ParseVk(val, g_cfg.keyBackend); }
     }
     fclose(f);
     if (g_cfg.rate < 0) { g_cfg.rate = 0; }
@@ -135,12 +192,13 @@ void ConfigLoad(void)
     if (g_cfg.voiceWindowMs < 200) { g_cfg.voiceWindowMs = 200; }
     if (g_cfg.voiceWindowMs > 6000) { g_cfg.voiceWindowMs = 6000; }
     if (g_cfg.minStableMs < 80) { g_cfg.minStableMs = 80; }
+    g_cfg.keyPrev = g_cfg.keyRepeat;   // Ctrl + re_read_key = previous line
 }
 
 void ConfigSave(void)
 {
     wchar_t path[MAX_PATH];
-    wsprintfW(path, L"%s\\%s", g_dataDir, A11Y_INI_NAME);
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s\\%s", g_dataDir, A11Y_INI_NAME);
     FILE* f = _wfopen(path, L"wb");
     if (!f) { return; }
     char backend[64] = { 0 };
@@ -154,9 +212,14 @@ void ConfigSave(void)
                "speak_voiced_lines=%d\r\n"
                "min_stable_ms=%d\r\n"
                "; log_draws=1 logs every painted string (diagnostics only)\r\n"
-               "log_draws=%d\r\n",
+               "log_draws=%d\r\n"
+               "; re_read_key = Backspace (virtual-key code or name: 8, 0x08, F8, A ...)\r\n"
+               "re_read_key=%d\r\n"
+               "; backend_key = Alt + this key cycles the speech backend\r\n"
+               "backend_key=%d\r\n",
             backend, g_cfg.rate, g_cfg.volume, g_cfg.voiceWindowMs,
-            g_cfg.speakVoicedLines, g_cfg.minStableMs, g_cfg.logDraws);
+            g_cfg.speakVoicedLines, g_cfg.minStableMs, g_cfg.logDraws,
+            g_cfg.keyRepeat, g_cfg.keyBackend);
     fclose(f);
 }
 
@@ -269,26 +332,78 @@ static int GameIsForeground(void)
 }
 
 // Hotkeys that belong to the patch. Return 1 to swallow the key.
+// ------------------------------------------------- hook -> tick hand-off ---
+// The low-level keyboard hook must return within LowLevelHooksTimeout (~300 ms)
+// or Windows silently removes it (keyboard "dies" until restart).  So the hook
+// only records what the user asked for; the tick thread does the work.
+static volatile LONG g_reqReplay;   // 1 = re-read newest line, 2 = previous line
+static volatile LONG g_reqCycle;    // 1 = cycle speech backend
+static CRITICAL_SECTION g_defCs;
+static int g_defReady;
+#define DEF_MAX 48
+#define DEF_LEN 192
+static wchar_t g_defLog[DEF_MAX][DEF_LEN];
+static volatile LONG g_defHead, g_defTail;
+
+static void DefInit(void)
+{
+    if (g_defReady) { return; }
+    InitializeCriticalSection(&g_defCs);
+    g_defHead = 0;
+    g_defTail = 0;
+    g_defReady = 1;
+}
+
+// Safe from the hook: no file IO, only a tiny ring push.
+static void LogDefer(const wchar_t* text)
+{
+    if (!g_defReady || !text) { return; }
+    EnterCriticalSection(&g_defCs);
+    LONG n = (g_defHead + 1) % DEF_MAX;
+    if (n != g_defTail) {
+        wcsncpy_s(g_defLog[g_defHead], DEF_LEN, text, _TRUNCATE);
+        g_defHead = n;
+    }
+    LeaveCriticalSection(&g_defCs);
+}
+
+static void DefDrain(void)
+{
+    if (!g_defReady) { return; }
+    for (;;) {
+        wchar_t one[DEF_LEN];
+        EnterCriticalSection(&g_defCs);
+        if (g_defTail == g_defHead) { LeaveCriticalSection(&g_defCs); return; }
+        wcscpy_s(one, DEF_LEN, g_defLog[g_defTail]);
+        g_defTail = (g_defTail + 1) % DEF_MAX;
+        LeaveCriticalSection(&g_defCs);
+        Logf(L"%s", one);
+    }
+}
+
 static int HandleHotkey(int vk, int isDown)
 {
-    static int s_alt = 0, s_shift = 0;
+    static int s_alt, s_shift;
     if (vk == VK_MENU) { s_alt = isDown; return 0; }
     if (vk == VK_SHIFT) { s_shift = isDown; return 0; }
-    if (!isDown) { return 0; }
-
     int ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
     if (vk == g_cfg.keyRepeat && s_alt && s_shift) {
         return 0; // Alt+Shift+Backspace is not ours
     }
     if (vk == g_cfg.keyBackend && s_alt && s_shift) {
-        int n = Speech_CycleBackend();
-        Logf(L"hotkey: backend cycled -> %s (ret=%d)", Speech_BackendName(), n);
+        if (isDown) {
+            LogDefer(L"hotkey: backend cycle requested");
+            InterlockedExchange(&g_reqCycle, 1);
+        }
         return 1;
     }
     if (vk == g_cfg.keyRepeat) {
-        if (ctrl) { RepeatPrev(); } else { SayReplay(); }
-        Logf(L"hotkey: re-read (ctrl=%d) vk=%d", ctrl, vk);
+        if (isDown) {
+            LogDefer(ctrl ? L"hotkey: re-read previous requested (ctrl)"
+                          : L"hotkey: re-read requested");
+            InterlockedExchange(&g_reqReplay, ctrl ? 2 : 1);
+        }
         return 1;
     }
     return 0;
@@ -303,8 +418,10 @@ static LRESULT CALLBACK LowLevelKb(int code, WPARAM w, LPARAM l)
             if (g_cfg.logDraws && isDown) {   // diagnostics: what reaches the hook
                 static int s_keySeen;
                 if (s_keySeen < 300) {
+                    wchar_t tmp[64];
                     s_keySeen++;
-                    Logf(L"key: vk=%d down", (int)k->vkCode);
+                    _snwprintf_s(tmp, _countof(tmp), _TRUNCATE, L"key: vk=%d down", (int)k->vkCode);
+                    LogDefer(tmp);
                 }
             }
             if (HandleHotkey((int)k->vkCode, isDown)) { return 1; }
@@ -363,6 +480,14 @@ static DWORD WINAPI TickThread(void*)
     for (;;) {
         Sleep(30);
         DWORD now = GetTickCount();
+        DefDrain();
+        if (InterlockedExchange(&g_reqCycle, 0)) {
+            int n = Speech_CycleBackend();
+            Logf(L"hotkey: backend cycled -> %s (ret=%d)", Speech_BackendName(), n);
+        }
+        LONG rp = InterlockedExchange(&g_reqReplay, 0);
+        if (rp == 1) { SayReplay(); }
+        else if (rp == 2) { RepeatPrev(); }
         TextTick(now);
         MenuTick(now);
     }
@@ -372,6 +497,7 @@ static DWORD WINAPI TickThread(void*)
 void StartA11y(HMODULE self)
 {
     g_self = self;
+    DefInit();
     CreateThread(0, 0, TickThread, 0, 0, 0);
     CreateThread(0, 0, KeyThread, 0, 0, 0);
 }

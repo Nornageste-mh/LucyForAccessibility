@@ -58,7 +58,23 @@ function Get-Sha256([string]$path) {
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
 function Get-PatchVersion {
-    # 优先读发布包里的 CHANGELOG.md 第一个版本标题；仓库里也认 src\version.h。
+    # 候选来源按可靠性排序：
+    #   1) 仓库 src\a11y.h 的 A11Y_VERSION（唯一真源，构建与发布都以它为准）
+    #   2) 发布包 README.md 里的「当前版本：**x.y.z.w**」
+    #   3) 发布包 CHANGELOG.md 首个版本标题
+    #   4) 旧版仓库 src\version.h（兼容历史）
+    $ah = Join-Path (Split-Path -Parent $PSScriptRoot) "src\a11y.h"
+    if (Test-Path -LiteralPath $ah) {
+        $t = Get-Content -LiteralPath $ah -Raw -Encoding UTF8
+        $m = [regex]::Match($t, '(?m)^\s*#\s*define\s+A11Y_VERSION\s+L?"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"?')
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    $rd = Join-Path $SourceDir "README.md"
+    if (Test-Path -LiteralPath $rd) {
+        $t = Get-Content -LiteralPath $rd -Raw -Encoding UTF8
+        $m = [regex]::Match($t, '当前版本[：:][^\r\n]*?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)')
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
     $cl = Join-Path $SourceDir "CHANGELOG.md"
     if (Test-Path -LiteralPath $cl) {
         $t = Get-Content -LiteralPath $cl -Raw -Encoding UTF8
@@ -175,7 +191,7 @@ if ($DryRun) {
     Say "  3) 校验复制后的 SHA256"
     Say "  4) 建目录 $a11yDir"
     if ($nvdaSource) { Say "  5) 复制 $nvdaSource -> $a11yDir\nvdaControllerClient.dll" }
-    else { Say "  5) 包内没有 nvdaControllerClient.dll，跳过（运行时从本机 NVDA 目录加载）" }
+    else { Say "  5) 包内没有 nvdaControllerClient.dll（按 NOTICE 不随包分发）；用 NVDA 的话请自行把它放进 a11y\，否则自动回退争渡/SAPI" }
     Say "  6) 写安装记录 $recordPath"
     Write-Host ""
     Write-Host "干跑结束，未改动任何文件。" -ForegroundColor Green
@@ -207,7 +223,7 @@ try {
         Copy-Item -LiteralPath $nvdaSource -Destination (Join-Path $a11yDir "nvdaControllerClient.dll") -Force
         Say "已复制 nvdaControllerClient.dll 到 a11y\"
     } else {
-        Say "包内没有 nvdaControllerClient.dll，跳过（运行时从本机 NVDA 目录加载）"
+        Say "包内没有 nvdaControllerClient.dll（按 NOTICE 不随包分发）；用 NVDA 的话请自行把它放进 a11y\，否则自动回退争渡/SAPI"
     }
 
     $record = [ordered]@{

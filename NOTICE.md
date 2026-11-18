@@ -30,8 +30,12 @@
 
 - **NVDA / nvdaControllerClient**：通过 NVDA 官方提供的控制器接口让 NVDA 朗读。
   该接口的**许可证与再分发条款尚未确认（待确认）**；在确认之前，发布包
-  **不随包分发** `nvdaControllerClient.dll`，改为在运行时从本机 NVDA 安装目录加载。
+  **不随包分发** `nvdaControllerClient.dll`。玩家如使用 NVDA，需要自行准备 32 位
+  客户端 DLL 放进 `游戏目录\a11y\`；补丁在运行时加载它，**不修改 NVDA 本体**。
   如后续确认可再分发，会在本文件与 [CHANGELOG.md](CHANGELOG.md) 中写明。
+  - 另需说明：**NVDA 本体以 GPLv2 发布**。本补丁只通过 NVDA 公开的控制器 API
+    （`nvdaControllerClient`）调用它，不包含、不修改、不链接 NVDA 本体源码；
+    这不改变本补丁自身的 MIT 许可，也不构成对 NVDA 的再分发。
 - **争渡读屏（ZDSR）**：商用读屏软件。本补丁只做**运行时动态调用**，
   不复制、不修改、不重分发其任何二进制或接口文件；玩家需自行安装并授权争渡。
 - **SAPI（Windows 语音 API）**：Windows 系统自带组件，本补丁只调用系统接口，
