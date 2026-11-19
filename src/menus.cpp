@@ -192,6 +192,9 @@ static DWORD g_slotWaitUntil;        // a slot click that produced no dialog
 static int g_slotWasSave;
 static DWORD g_choiceMuteUntil;      // do not re-detect choices right after a click
 static DWORD g_dlgMuteUntil;         // do not re-detect a box that is closing
+static int g_saveLoadMode = SCR_SAVE; // which of the two we opened (page counter cannot tell)
+static DWORD g_pageSeenAt;           // last time the "N/10" counter was on screen
+static DWORD s_screenAt;             // when we entered the current screen
 
 // Build the choice screen from the live draw record.  The bars stay on screen
 // while the branch is being resolved, so the list is built once and then kept
@@ -447,11 +450,21 @@ static void Activate(void)
     if (g_screen == SCR_CONFIRM) {
         // the box lingers for a frame after the click; do not bounce back into it
         g_dlgMuteUntil = GetTickCount() + 3000;
+        if (g_sel == 0 && g_prev == SCR_LOAD) {
+            // "是" on the load box: the game reads the slot and goes back to the
+            // story, so follow it once the click (2 s hold) and the load settle.
+            g_pendingScreen = SCR_NOVEL;
+            g_pendingScreenTick = GetTickCount() + 4000;
+            Logf(L"menu: load confirmed, waiting for the story screen");
+        }
     }
     ClickAt(pt, twice);
 
     if (it->gotoScreen >= 0) {
         g_prev = g_screen;
+        if (it->gotoScreen == SCR_SAVE || it->gotoScreen == SCR_LOAD) {
+            g_saveLoadMode = it->gotoScreen;
+        }
         g_pendingScreen = it->gotoScreen;
         g_pendingScreenTick = GetTickCount() + 400;
     } else if (it->gotoScreen == -2) {
@@ -485,34 +498,45 @@ static int Adjust(int dir)
     return 1;
 }
 
-static void Move(int dx, int dy)
+// Framework convention (docs/操作逻辑公约.md): Up/Down walk the controls, and
+// Left/Right only adjust the focused control (a slider).  So "walk" is a single
+// sequence in reading order -- top to bottom, then left to right -- which covers
+// the vertical lists (title, pause) and the slot grids (save/load) alike.
+static void MoveOrder(int dir)
 {
     const ScreenDef* s = Cur();
     if (!s->items || s->count <= 1) { return; }
+    if (s->count > 32) { return; }
     if (g_sel < 0 || g_sel >= s->count) { g_sel = 0; }
-    int cx = s->items[g_sel].x + s->items[g_sel].w / 2;
-    int cy = s->items[g_sel].y + s->items[g_sel].h / 2;
-    int best = -1;
-    long bestScore = 0;
-    for (int i = 0; i < s->count; i++) {
-        if (i == g_sel) { continue; }
-        int ix = s->items[i].x + s->items[i].w / 2;
-        int iy = s->items[i].y + s->items[i].h / 2;
-        long vx = ix - cx, vy = iy - cy;
-        if (dx && vx * dx <= 0) { continue; }
-        if (dy && vy * dy <= 0) { continue; }
-        long along = dx ? vx * dx : vy * dy;
-        long across = dx ? (vy < 0 ? -vy : vy) : (vx < 0 ? -vx : vx);
-        long score = along + across * 4;
-        if (best < 0 || score < bestScore) { best = i; bestScore = score; }
+    int order[32];
+    for (int i = 0; i < s->count; i++) { order[i] = i; }
+    // insertion sort by (row band, x); the band keeps items of one row together
+    // even when their y values differ by a few pixels
+    for (int i = 1; i < s->count; i++) {
+        int cur = order[i];
+        int keyY = s->items[cur].y / 24;
+        int keyX = s->items[cur].x;
+        int j = i - 1;
+        while (j >= 0) {
+            int py = s->items[order[j]].y / 24;
+            int px = s->items[order[j]].x;
+            if (py < keyY || (py == keyY && px <= keyX)) { break; }
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = cur;
     }
-    if (best >= 0) {
-        g_sel = best;
-        g_confirmPending = -1;
-        Logf(L"menu: selected %d \"%s\"", g_sel, s->items[g_sel].label);
-        Announce(g_sel);
-        AnnounceValue(g_sel);
-    }
+    int pos = 0;
+    for (int i = 0; i < s->count; i++) { if (order[i] == g_sel) { pos = i; break; } }
+    pos += dir;
+    if (pos < 0) { pos = 0; }
+    if (pos >= s->count) { pos = s->count - 1; }
+    if (order[pos] == g_sel) { return; }
+    g_sel = order[pos];
+    g_confirmPending = -1;
+    Logf(L"menu: selected %d \"%s\"", g_sel, s->items[g_sel].label);
+    Announce(g_sel);
+    AnnounceValue(g_sel);
 }
 
 void MenuInit(HWND w)
@@ -529,6 +553,7 @@ void MenuInit(HWND w)
         Logf(L"menu: init, window=%p", (void*)w);
     }
     InputHookInit(w);
+    InputHookSetHold(g_cfg.clickHoldMs);
 }
 
 void MenuSetGameWnd(HWND w) { g_wnd = w; }
@@ -545,6 +570,12 @@ void MenuSetScreen(int screen)
     g_screen = screen;
     g_sel = 0;
     g_confirmPending = -1;
+    // Any click still queued belongs to the screen we are leaving.  Letting it
+    // land on the next page is what made clicks look "uncontrolled" (a save slot
+    // click reopening the confirm box every few seconds).
+    InputClickFlush();
+    g_pageSeenAt = GetTickCount();
+    s_screenAt = g_pageSeenAt;
     // The engine fades a new page in for the better part of a second.  Keys that
     // arrive during the fade belong to nobody: they must not be interpreted as
     // input for a page the player cannot see yet (0.2.4.0 bug: a fast Enter on the
@@ -583,11 +614,16 @@ void MenuOnKey(int vk, int isDown)
     if (!isDown) { return; }
     // A synthetic click is still being played out, and the engine needs the button
     // held for ~2 s, so a second activation now would only fill the queue.  Story
-    // and pass-through screens never click, so they keep working.
+    // and pass-through screens never click, so they keep working.  Navigation and
+    // slider adjustment stay live: only activation has to wait for the click.
     if (InputClickBusy() && g_screen != SCR_NOVEL && g_screen != SCR_HELP &&
         g_screen != SCR_BACKLOG) {
-        Logf(L"menu: click in progress, key %d ignored", vk);
-        return;
+        int nav = (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT ||
+                   vk == VK_BACK || vk == VK_HOME || vk == VK_END);
+        if (!nav) {
+            Logf(L"menu: click in progress, key %d ignored", vk);
+            return;
+        }
     }
     // Page still fading in: swallow keys so nobody activates an invisible item.
     if (g_screen != SCR_NOVEL && g_screen != SCR_HELP && g_screen != SCR_BACKLOG &&
@@ -619,8 +655,17 @@ void MenuOnKey(int vk, int isDown)
             g_pendingScreenTick = GetTickCount() + 350;
             return;
         }
-        // every other screen closes with Escape as well: follow the game
-        g_pendingScreen = g_prev;
+        if (g_screen == SCR_PAUSE) {
+            // Escape in the pause menu is the game's own "back to the story":
+            // follow it deterministically instead of guessing from redraws.
+            g_pendingScreen = SCR_NOVEL;
+            g_pendingScreenTick = GetTickCount() + 350;
+            return;
+        }
+        // every other screen closes with Escape as well, and the game always
+        // lands on the pause menu from there (not "wherever we came from", which
+        // may be a screen our state only guessed).
+        g_pendingScreen = SCR_PAUSE;
         g_pendingScreenTick = GetTickCount() + 350;
         return;
     }
@@ -632,8 +677,9 @@ void MenuOnKey(int vk, int isDown)
         // The branch bars have no keyboard, so arrows pick a bar and Enter runs
         // the click the player would have made with the mouse.  Nothing else is
         // swallowed: Space, Escape, wheel and skip still go to the game.
-        if (vk == VK_UP)    { Move(0, -1); g_consumed = 1; return; }
-        if (vk == VK_DOWN)  { Move(0, 1);  g_consumed = 1; return; }
+        if (vk == VK_UP)    { MoveOrder(-1); g_consumed = 1; return; }
+        if (vk == VK_DOWN)  { MoveOrder(1);  g_consumed = 1; return; }
+        if (vk == VK_BACK)  { Announce(g_sel); g_consumed = 1; return; }
         if (vk == VK_RETURN || vk == VK_SPACE) {
             Activate();
             g_consumed = 1;
@@ -651,14 +697,23 @@ void MenuOnKey(int vk, int isDown)
     }
 
     switch (vk) {
-    case VK_UP:    Move(0, -1); g_consumed = 1; break;
-    case VK_DOWN:  Move(0, 1); g_consumed = 1; break;
+    case VK_UP:    MoveOrder(-1); g_consumed = 1; break;
+    case VK_DOWN:  MoveOrder(1);  g_consumed = 1; break;
     case VK_LEFT:
-        if (!Adjust(-1)) { Move(-1, 0); }
+        // Left/Right adjust the focused control only; they never move the focus
+        // (Framework convention, and the player asked for exactly this).
+        Adjust(-1);
         g_consumed = 1;
         break;
     case VK_RIGHT:
-        if (!Adjust(1)) { Move(1, 0); }
+        Adjust(1);
+        g_consumed = 1;
+        break;
+    case VK_BACK:
+        // Backspace re-reads the focused control (story re-read is the same key,
+        // handled outside the menu).
+        Announce(g_sel);
+        AnnounceValue(g_sel);
         g_consumed = 1;
         break;
     case VK_RETURN:
@@ -694,6 +749,12 @@ void MenuTick(DWORD now)
     if (g_screen == SCR_TITLE && TextStoryRecent(800)) {
         MenuSetScreen(SCR_NOVEL);
     }
+    // Note: we deliberately do NOT follow "pause menu -> story" by watching for a
+    // story redraw.  Measured 2026-11-19 (prod_logs/sv160443): opening the save
+    // page redraws the dialogue box once, ~1.2 s after the pause menu came up, so
+    // every redraw-based rule fired on a page transition and threw the state back
+    // to the story screen.  Escape is a deterministic toggle instead (see the
+    // VK_ESCAPE handling): story -> pause, pause -> story, any sub-page -> pause.
     // Desync guard: if we think we are in the story but the game never actually
     // started (a swallowed synthetic click, a failed title hand-off), fall back
     // to the title state so Enter tries again instead of the player being stuck
@@ -711,6 +772,45 @@ void MenuTick(DWORD now)
             MenuSetScreen(SCR_TITLE);
         }
     } else { s_novelUntil = 0; s_novelHadStory = 0; }
+
+    // Save / load screens paint nothing but the page counter ("1/10"), so the
+    // counter is both our "which screen is this" probe and the page number.  The
+    // player reported that the patch did not notice when the game went back from
+    // the save page to the pause menu: this is that fix -- when the counter
+    // disappears the save/load page is gone, and Escape always lands on pause.
+    static int s_pageSeenOnScreen;
+    static DWORD s_pageCheck;
+    if ((long)(now - s_pageCheck) >= 0) {
+        s_pageCheck = now + 250;
+        int page = 0, total = 0;
+        int hasPage = TextPageIndicator(&page, &total);
+        if (hasPage) {
+            g_pageSeenAt = now;
+            if (page >= 1 && page != g_savePage) {
+                Logf(L"menu: page counter sync %d -> %d of %d", g_savePage, page, total);
+                g_savePage = page;
+            }
+            if (g_screen == SCR_SAVE || g_screen == SCR_LOAD) {
+                s_pageSeenOnScreen = 1;
+            } else if (g_screen != SCR_CONFIRM) {
+                // The player reached the page with the mouse or a loaded save:
+                // adopt it as our screen state instead of staying on "pause".
+                int target = (g_saveLoadMode == SCR_LOAD) ? SCR_LOAD : SCR_SAVE;
+                g_suppressName = 1;
+                MenuSetScreen(target);
+                s_pageSeenOnScreen = 1;
+                wchar_t buf[80];
+                wsprintfW(buf, L"第%d页，共%d页", page, total);
+                SpeakMenu(buf);
+            }
+        } else if ((g_screen == SCR_SAVE || g_screen == SCR_LOAD) && s_pageSeenOnScreen &&
+                   (DWORD)(now - g_pageSeenAt) > 3200) {
+            int back = TextStoryRecent(800) ? SCR_NOVEL : SCR_PAUSE;
+            s_pageSeenOnScreen = 0;
+            Logf(L"menu: page counter gone, following the game to screen %d", back);
+            MenuSetScreen(back);
+        }
+    }
     static DWORD s_choiceCheck;
     if ((long)(now - s_choiceCheck) >= 0) {
         s_choiceCheck = now + 250;
@@ -751,6 +851,8 @@ void MenuTick(DWORD now)
         if (has && g_screen != SCR_CONFIRM) {
             g_suppressName = 1;
             MenuSetScreen(SCR_CONFIRM);
+            // A queued click landing on the box would click 是 or 否 by accident.
+            InputClickFlush();
             SpeakMenu(line);
             Logf(L"menu: dialog detected \"%s\"", line);
         } else if (!has && g_screen == SCR_CONFIRM) {

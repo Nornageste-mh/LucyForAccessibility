@@ -239,6 +239,70 @@ int TextDialogLine(wchar_t* out, int cap)
     return found;
 }
 
+// 1 if a story-text draw happened at or after `since` (and is recent).  Used to
+// tell "the game is drawing the story again" from "the story box is still in the
+// draw record from before the menu opened".
+int TextStorySince(DWORD since)
+{
+    Cs();
+    EnterCriticalSection(&g_cs);
+    int found = 0;
+    DWORD now = GetTickCount();
+    for (int i = 0; i < DRAW_MAX && !found; i++) {
+        int idx = (g_drawHead - 1 - i) % DRAW_MAX;
+        if (idx < 0) { idx += DRAW_MAX; }
+        DrawRec* d = &g_draws[idx];
+        if (!d->used || !d->text[0]) { continue; }
+        if ((DWORD)(now - d->tick) > 1500) { continue; }
+        if ((long)(d->tick - since) < 0) { continue; }
+        if (d->fmt & 0x100) { continue; }
+        if ((d->fmt & 0x410) != 0x410) { continue; }
+        found = 1;
+    }
+    LeaveCriticalSection(&g_cs);
+    return found;
+}
+
+// ---- save / load page counter ---------------------------------------------
+// Those two screens paint almost no text at all; the only thing they do paint is
+// the page counter ("1/10" at 938,658, format 0x100, zero box).  Seeing it is
+// therefore proof that the game is on the save or load page, and its value keeps
+// our idea of the current page in sync even when the player pages with the mouse.
+int TextPageIndicator(int* page, int* total)
+{
+    if (page) { *page = 0; }
+    if (total) { *total = 0; }
+    Cs();
+    EnterCriticalSection(&g_cs);
+    int found = 0;
+    DWORD now = GetTickCount();
+    for (int i = 0; i < DRAW_MAX && !found; i++) {
+        int idx = (g_drawHead - 1 - i) % DRAW_MAX;
+        if (idx < 0) { idx += DRAW_MAX; }
+        DrawRec* d = &g_draws[idx];
+        if (!d->used || !d->text[0]) { continue; }
+        // The counter is static text: it is painted once when the page opens and
+        // never again, so a short staleness window would never see it.
+        if ((DWORD)(now - d->tick) > 2500) { continue; }
+        size_t len = wcslen(d->text);
+        if (len < 3 || len > 9) { continue; }
+        const wchar_t* p = d->text;
+        int cur = 0, cnt = 0, digits = 0;
+        while (*p >= L'0' && *p <= L'9' && digits < 3) { cur = cur * 10 + (*p - L'0'); p++; digits++; }
+        if (!digits || *p != L'/') { continue; }
+        p++;
+        digits = 0;
+        while (*p >= L'0' && *p <= L'9' && digits < 3) { cnt = cnt * 10 + (*p - L'0'); p++; digits++; }
+        if (!digits || *p) { continue; }
+        if (cur < 1 || cnt < 1 || cnt > 99 || cur > cnt) { continue; }
+        if (page) { *page = cur; }
+        if (total) { *total = cnt; }
+        found = 1;
+    }
+    LeaveCriticalSection(&g_cs);
+    return found;
+}
+
 // ---- choices --------------------------------------------------------------
 // The first branch of the story is drawn as two full width bars, each with one
 // line of text (measured: text boxes 174x28 and 140x28 at y 156 / 295, hover
@@ -365,9 +429,20 @@ static HRESULT __stdcall HookDrawTextW(void* self, void* unused, const WCHAR* st
                 const wchar_t* tag = L"";
                 if (IsStoryDraw(str, count, format, (const LONG*)rect)) { tag = L" [story]"; }
                 else if ((format & 0x100) && b && b[2] >= 100 && wcslen(str) <= 10) { tag = L" [name]"; }
+                // One line per draw: the strings themselves contain newlines, and a
+                // multi-line log entry cannot be read back reliably.
+                wchar_t flat[LINE_LEN];
+                int  n = 0;
+                for (const wchar_t* p = str; *p && n < LINE_LEN - 1; p++)
+                {
+                    wchar_t ch = *p;
+                    if (ch == L'\r') { continue; }
+                    flat[n++] = (ch == L'\n' || ch == L'\t') ? L'|' : ch;
+                }
+                flat[n] = 0;
                 Logf(L"DRAW%s cnt=%d fmt=0x%X x=%ld y=%ld w=%ld h=%ld \"%s\"",
                      tag, count, format, b ? b[0] : -1, b ? b[1] : -1, b ? b[2] : -1,
-                     b ? b[3] : -1, str);
+                     b ? b[3] : -1, flat);
             }
         }
     }

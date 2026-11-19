@@ -1,4 +1,4 @@
-﻿// inputhook.cpp -- see inputhook.h for the measurements behind this design.
+// inputhook.cpp -- see inputhook.h for the measurements behind this design.
 #include <windows.h>
 #include "a11y.h"
 #include "inputhook.h"
@@ -89,7 +89,7 @@ static int PatchIat(HMODULE mod, const char* dllName, const char* funcName, void
 // Timing measured on the retail build: 120 ms and 700 ms holds are ignored,
 // 2000 ms is accepted every time.  A double click needs the two clicks far apart
 // (the first one of a pair is often swallowed by the engine).
-#define CLICK_QUEUE_MAX  4
+#define CLICK_QUEUE_MAX  2
 #define CLICK_MOVE_OUT   40     // ms before aiming at the target
 #define CLICK_MOVE_IN    100    // ms the pointer rests on the target before press
 #define CLICK_DEFAULT_HOLD 2000 // button-down time the engine needs to see
@@ -108,6 +108,7 @@ static int g_queueHead;
 static ClickReq g_cur;
 static int g_stage;         // 0 idle, 1 moving out, 2 moving in, 3 pressed, 4 gap
 static DWORD g_stageAt;
+static int g_defHold = CLICK_DEFAULT_HOLD;
 
 static void PostMove(int clientX, int clientY)
 {
@@ -156,12 +157,43 @@ int InputClickHoldAt(int clientX, int clientY, int holdMs)
 
 int InputClickAt(int clientX, int clientY)
 {
-    return InputClickHoldAt(clientX, clientY, CLICK_DEFAULT_HOLD);
+    return InputClickHoldAt(clientX, clientY, g_defHold);
 }
 
 int InputClickBusy(void)
 {
     return (g_stage != 0 || g_queueCount > 0) ? 1 : 0;
+}
+
+void InputClickFlush(void)
+{
+    int queued = g_queueCount;
+    g_queueCount = 0;
+    g_queueHead = 0;
+    // A click that is already pressing (stage 3) is the one the player just asked
+    // for -- flushing it is what made the save page never open: the page's own
+    // click got cancelled 1.9 s into its 2 s hold, so the engine saw a short press
+    // and ignored it.  Only queued extras and not-yet-pressed work is dropped.
+    if (g_stage == 3 || g_stage == 4) {
+        if (queued) { Logf(L"input: click queue dropped (%d queued, pressing kept)", queued); }
+        return;
+    }
+    int was = queued + (g_stage ? 1 : 0);
+    g_stage = 0;
+    g_fakeButton = 0;
+    if (was && g_wnd) {
+        // release anything the engine may still think is held down
+        PostMessageW(g_wnd, WM_LBUTTONUP, 0, MAKELPARAM(g_cur.x, g_cur.y));
+    }
+    if (was) { Logf(L"input: click cancelled before press (%d pending)", was); }
+}
+
+void InputHookSetHold(int ms)
+{
+    if (ms < 400) { ms = 400; }
+    if (ms > 4000) { ms = 4000; }
+    if (ms != g_defHold) { Logf(L"input: click hold -> %d ms", ms); }
+    g_defHold = ms;
 }
 
 static void StartNext()

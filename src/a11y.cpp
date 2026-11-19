@@ -152,6 +152,7 @@ void ConfigLoad(void)
     g_cfg.speakVoicedLines = 0;
     g_cfg.minStableMs = 260;
     g_cfg.logDraws = 0;
+    g_cfg.clickHoldMs = 2000;
     g_cfg.keyRepeat = VK_BACK;
     g_cfg.keyPrev = VK_BACK;      // with Ctrl
     g_cfg.keyBackendMod = VK_MENU; // Alt
@@ -181,6 +182,7 @@ void ConfigLoad(void)
         else if (!_wcsicmp(key, L"speak_voiced_lines")) { g_cfg.speakVoicedLines = _wtoi(val); }
         else if (!_wcsicmp(key, L"min_stable_ms")) { g_cfg.minStableMs = _wtoi(val); }
         else if (!_wcsicmp(key, L"log_draws")) { g_cfg.logDraws = _wtoi(val); }
+    else if (!_wcsicmp(key, L"click_hold_ms")) { g_cfg.clickHoldMs = _wtoi(val); }
         else if (!_wcsicmp(key, L"re_read_key")) { g_cfg.keyRepeat = ParseVk(val, g_cfg.keyRepeat); }
         else if (!_wcsicmp(key, L"backend_key")) { g_cfg.keyBackend = ParseVk(val, g_cfg.keyBackend); }
     }
@@ -192,6 +194,8 @@ void ConfigLoad(void)
     if (g_cfg.voiceWindowMs < 200) { g_cfg.voiceWindowMs = 200; }
     if (g_cfg.voiceWindowMs > 6000) { g_cfg.voiceWindowMs = 6000; }
     if (g_cfg.minStableMs < 80) { g_cfg.minStableMs = 80; }
+    if (g_cfg.clickHoldMs < 400) { g_cfg.clickHoldMs = 400; }
+    if (g_cfg.clickHoldMs > 4000) { g_cfg.clickHoldMs = 4000; }
     g_cfg.keyPrev = g_cfg.keyRepeat;   // Ctrl + re_read_key = previous line
 }
 
@@ -213,12 +217,14 @@ void ConfigSave(void)
                "min_stable_ms=%d\r\n"
                "; log_draws=1 logs every painted string (diagnostics only)\r\n"
                "log_draws=%d\r\n"
+               "; click_hold_ms = how long the synthetic mouse button stays down (the engine ignores < 700)\r\n"
+               "click_hold_ms=%d\r\n"
                "; re_read_key = Backspace (virtual-key code or name: 8, 0x08, F8, A ...)\r\n"
                "re_read_key=%d\r\n"
                "; backend_key = Alt + this key cycles the speech backend\r\n"
                "backend_key=%d\r\n",
             backend, g_cfg.rate, g_cfg.volume, g_cfg.voiceWindowMs,
-            g_cfg.speakVoicedLines, g_cfg.minStableMs, g_cfg.logDraws,
+            g_cfg.speakVoicedLines, g_cfg.minStableMs, g_cfg.logDraws, g_cfg.clickHoldMs,
             g_cfg.keyRepeat, g_cfg.keyBackend);
     fclose(f);
 }

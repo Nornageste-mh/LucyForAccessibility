@@ -14,7 +14,7 @@
 
 #include <windows.h>
 
-#define A11Y_VERSION      L"0.1.0.0"
+#define A11Y_VERSION      L"0.1.0.1"
 #define A11Y_PRODUCT      L"露西 -她所期望的一切- 无障碍补丁"
 #define A11Y_LOG_NAME     L"a11y.log"
 #define A11Y_INI_NAME     L"config.ini"
@@ -29,6 +29,7 @@ struct A11yConfig {
     int  speakVoicedLines;    // 0 = a voiced line is never read on its own (design rule)
     int  minStableMs;         // a line is complete once it stopped growing this long
     int  logDraws;            // 1 = log every DrawTextW call (diagnostics only)
+    int  clickHoldMs;         // synthetic button-down time; the engine ignores < 700
     // keys (virtual-key codes; 8 = Backspace)
     int  keyRepeat;           // re-read the current / last line
     int  keyPrev;             // re-read the previous line
@@ -69,9 +70,15 @@ void TextSetStoryActive(int on);
 // setting's value aloud; the game paints values, it does not expose them).
 int  TextValueNear(int y, int h, wchar_t* out, int cap);
 int  TextDialogLine(wchar_t* out, int cap);
+// Page counter of the save/load screens ("1/10"): present only on those screens,
+// so it tells us both "which screen" and "which page".
+int  TextPageIndicator(int* page, int* total);
 // 1 when story text was drawn in the last maxAgeMs: the game may move on its
 // own (mouse, auto mode, a loaded save), so the screen has to follow it.
 int  TextStoryRecent(unsigned maxAgeMs);
+// 1 if the game painted story text at or after the given tick (and recently).
+// Distinguishes "drawing the story again" from "the old story box is still there".
+int  TextStorySince(DWORD since);
 
 // ---- story choices --------------------------------------------------------
 // The game's branch options are mouse-only bars; this is how the patch learns

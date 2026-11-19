@@ -29,6 +29,15 @@ int  InputClickHoldAt(int clientX, int clientY, int holdMs);
 // 1 while a queued click is still being played out.
 int  InputClickBusy(void);
 
+// Drop every queued click.  Called when the screen changes under our feet (or a
+// modal box appears): stale clicks landing on the next screen were the "clicks
+// that fire on their own" the player saw.
+void InputClickFlush(void);
+
+// Button-down time in ms.  The engine ignores short presses (700 ms fails,
+// 2000 ms works -- measured); clamped to [400, 4000].
+void InputHookSetHold(int ms);
+
 // Drive the queue; call from the tick thread (every ~20-40 ms).
 void InputTick(void);
 
